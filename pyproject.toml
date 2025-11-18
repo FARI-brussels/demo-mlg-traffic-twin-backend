@@ -1,0 +1,54 @@
+[project]
+name = "scenario-generator-tt"
+version = "0.1.0"
+description = "Traffic scenario generator backend (Flask) with multiple standalone modules"
+requires-python = ">=3.9"
+dependencies = [
+  "Flask>=2.2,<4",
+  "Flask-Cors>=4.0.0,<5",
+  "requests>=2.25.0",
+  "geojson>=2.5.0",
+  "lxml>=4.6.0",
+  "numpy>=1.21.0",
+  "pandas>=1.3.0",
+  "pyproj==3.6.1",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=6.0.0",
+  "black>=22.0.0",
+  "ruff>=0.1.0",
+  "mypy>=0.950",
+]
+
+[project.scripts]
+scenario-generator = "main:main"
+
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["*"]
+exclude = ["__pycache__", "*.pyc", "output", "*.egg-info"]
+
+[tool.setuptools.package-data]
+"*" = ["*.json", "*.xml", "*.geojson"]
+
+[tool.black]
+line-length = 88
+target-version = ['py39']
+
+[tool.ruff]
+line-length = 88
+target-version = "py39"
+select = ["E", "F", "W", "C90", "I", "N", "UP", "YTT", "S", "BLE", "FBT", "B", "A", "COM", "C4", "DTZ", "T10", "DJ", "EM", "EXE", "FA", "ISC", "ICN", "G", "INP", "PIE", "T20", "PYI", "PT", "Q", "RSE", "RET", "SLF", "SLOT", "SIM", "TID", "TCH", "INT", "ARG", "PTH", "TD", "FIX", "ERA", "PD", "PGH", "PL", "TRY", "FLY", "NPY", "AIR", "PERF", "FURB", "LOG", "RUF"]
+ignore = ["S101", "T201", "PLR0913", "PLR0912", "PLR0915", "COM812", "ISC001"]
+
+[tool.mypy]
+python_version = "3.9"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true 

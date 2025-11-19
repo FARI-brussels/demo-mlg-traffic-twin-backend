@@ -3,6 +3,7 @@ import json
 import shlex
 import tempfile
 import subprocess
+import threading
 from pathlib import Path
 from io import BytesIO
 from zipfile import ZipFile, ZIP_DEFLATED
@@ -29,6 +30,9 @@ GEOJSON_PATH = "net.geojson"
 
 app = Flask(__name__)
 CORS(app)
+
+# Global lock for simulation to queue requests and prevent concurrent SUMO issues
+SIMULATION_LOCK = threading.Lock()
 
 def ensure_env() -> None:
     """Ensure environment variables and binaries we rely on are available."""
@@ -75,26 +79,25 @@ def run(cmd: List[str], cwd: Optional[Path] = None) -> None:
     )
 
 
-def build_output_paths(base_dir: Path, output_dir: str = "output") -> Dict[str, Path]:
-    o = base_dir / output_dir
-    o.mkdir(parents=True, exist_ok=True)
+def build_output_paths(output_dir: Path) -> Dict[str, Path]:
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     paths = {
-        "output_dir": o,
-        "sumo_network": o / "osm.net.xml",
-        "routes_xml": o / "routes.xml",
-        "trips_xml": o / "trips.xml",
-        "rerouter_file": o / "rerouters.xml",
-        "fcd_with": o / "fcd_with.out.xml",
-        "fcd_wout": o / "fcd_without.out.xml",
-        "tripinfo_with": o / "tripinfo_with.xml",
-        "tripinfo_wout": o / "tripinfo_without.xml",
-        "edgedata_with": o / "edgedata_with.xml",
-        "edgedata_wout": o / "edgedata_without.xml",
-        "fcd_trips_json_with": o / "fcd_trips_with.json",
-        "fcd_trips_json_wout": o / "fcd_trips_without.json",
-        "congestion_map_with": o / "congestion_with.geojson",
-        "congestion_map_wout": o / "congestion_without.geojson",
+        "output_dir": output_dir,
+        "sumo_network": output_dir / "osm.net.xml",
+        "routes_xml": output_dir / "routes.xml",
+        "trips_xml": output_dir / "trips.xml",
+        "rerouter_file": output_dir / "rerouters.xml",
+        "fcd_with": output_dir / "fcd_with.out.xml",
+        "fcd_wout": output_dir / "fcd_without.out.xml",
+        "tripinfo_with": output_dir / "tripinfo_with.xml",
+        "tripinfo_wout": output_dir / "tripinfo_without.xml",
+        "edgedata_with": output_dir / "edgedata_with.xml",
+        "edgedata_wout": output_dir / "edgedata_without.xml",
+        "fcd_trips_json_with": output_dir / "fcd_trips_with.json",
+        "fcd_trips_json_wout": output_dir / "fcd_trips_without.json",
+        "congestion_map_with": output_dir / "congestion_with.geojson",
+        "congestion_map_wout": output_dir / "congestion_without.geojson",
     }
     return paths
 
@@ -292,6 +295,9 @@ def simulate() -> Any:
       - routes_zip: ZIP file containing routes.xml (optional, if not provided, random routes will be generated)
       - fcd_filter_shape: JSON object with centerLon, centerLat, radiusKm (optional, filters FCD output to circular area)
     """
+    # Base dir is the directory containing this file
+    base_dir = Path(__file__).resolve().parent
+
     try:
         ensure_env()
 
@@ -302,9 +308,6 @@ def simulate() -> Any:
         zip_file = request.files['network_zip']
         if zip_file.filename == '':
             return jsonify({"error": "No network file selected"}), 400
-
-        # Base dir is the directory containing this file
-        base_dir = Path(__file__).resolve().parent
 
         # Parse form data
         begin_time = int(request.form.get("begin_time"))
@@ -324,170 +327,176 @@ def simulate() -> Any:
             if not isinstance(fcd_filter_shape, dict):
                 return jsonify({"error": "fcd_filter_shape must be an object"}), 400
         
-        # Extract the network XML from the uploaded ZIP
-        output_dir = "output"
-        paths = build_output_paths(base_dir, output_dir)
-        
-        zip_bytes = BytesIO(zip_file.read())
-        with ZipFile(zip_bytes, 'r') as zf:
-            xml_files = [name for name in zf.namelist() if name.endswith('.net.xml')]
-            if not xml_files:
-                return jsonify({"error": "No .net.xml file found in the uploaded ZIP"}), 400
-            
-            xml_filename = xml_files[0]
-            net_xml_content = zf.read(xml_filename).decode('utf-8')
-
-        # Save the network XML to the output directory
-        net_path = paths["output_dir"] / "simulation.net.xml"
-        with open(net_path, "w", encoding="utf-8") as f:
-            f.write(net_xml_content)
-        
-        # 1) Rerouters (only if closed edges provided)
-        print("---- generating rerouters ----")
-        generate_rerouters(
-            network=net_path,
-            closed_edges=[str(e) for e in closed_edges],
-            begin=begin_time,
-            end=end_time,
-            out_xml=paths["rerouter_file"],
-        )
-        
-        # 2) Trips and routes - check if routes_zip was provided
-        print("---- handling routes ----")
-        if 'routes_zip' in request.files and request.files['routes_zip'].filename != '':
-            print("---- extracting uploaded routes ----")
-            routes_zip_file = request.files['routes_zip']
-            routes_zip_bytes = BytesIO(routes_zip_file.read())
-            
-            with ZipFile(routes_zip_bytes, 'r') as rzf:
-                routes_xml_files = [name for name in rzf.namelist() if name.endswith('.xml')]
-                if not routes_xml_files:
-                    return jsonify({"error": "No .xml file found in the uploaded routes ZIP"}), 400
+        # Use global lock to enforce serial execution
+        with SIMULATION_LOCK:
+            # Use temporary directory for request isolation
+            with tempfile.TemporaryDirectory() as tmp_dir_str:
+                tmp_dir = Path(tmp_dir_str)
                 
-                routes_xml_filename = routes_xml_files[0]
-                routes_xml_content = rzf.read(routes_xml_filename).decode('utf-8')
-            
-            # Save the routes XML
-            routes_xml = paths["output_dir"] / "uploaded_routes.xml"
-            with open(routes_xml, "w", encoding="utf-8") as f:
-                f.write(routes_xml_content)
-        else:
-            print("---- generating random trips and routes ----")
-            generate_random_trips(
-                network=net_path,
-                begin=begin_time,
-                end=end_time,
-                insertion_rate=insertion_rate,
-                routes_xml=paths["routes_xml"],
-                trips_xml=paths["trips_xml"],
-            )
-            routes_xml = paths["routes_xml"]
-        print("---- running sumo with closed edges ----")
-        # 3) SUMO simulations
-        run_sumo(
-            network=net_path,
-            routes_xml=routes_xml,
-            begin=begin_time,
-            end=end_time,
-            fcd_out=paths["fcd_with"],
-            tripinfo_out=paths["tripinfo_with"],
-            edgedata_out=paths["edgedata_with"],
-            rerouter_xml=paths["rerouter_file"] if closed_edges else None,
-            fcd_filter_shape=fcd_filter_shape,
-            output_dir=paths["output_dir"],
-            
-        )
-        print("---- running sumo without closed edges ----")
-        run_sumo(
-            network=net_path,
-            routes_xml=routes_xml,
-            begin=begin_time,
-            end=end_time,
-            fcd_out=paths["fcd_wout"],
-            tripinfo_out=paths["tripinfo_wout"],
-            edgedata_out=paths["edgedata_wout"],
-            rerouter_xml=None,
-            fcd_filter_shape=fcd_filter_shape,
-            output_dir=paths["output_dir"],
-        )
-        print("---- converting outputs ----")
-        # 4) Convert outputs
-        convert_fcd_to_outputs(
-            base_dir=base_dir,
-            fcd_with=paths["fcd_with"],
-            fcd_wout=paths["fcd_wout"],
-            trips_json_with=paths["fcd_trips_json_with"],
-            trips_json_wout=paths["fcd_trips_json_wout"],
-            insertion_rate=insertion_rate,
-            closed_edges=[str(e) for e in closed_edges],
-            network_xml=net_path,
-        )
+                # Setup output paths in temp dir
+                paths = build_output_paths(tmp_dir)
+                
+                # Extract the network XML from the uploaded ZIP
+                zip_bytes = BytesIO(zip_file.read())
+                with ZipFile(zip_bytes, 'r') as zf:
+                    xml_files = [name for name in zf.namelist() if name.endswith('.net.xml')]
+                    if not xml_files:
+                        return jsonify({"error": "No .net.xml file found in the uploaded ZIP"}), 400
+                    
+                    xml_filename = xml_files[0]
+                    net_xml_content = zf.read(xml_filename).decode('utf-8')
 
-        # 5) Generate congestion maps
-        print("---- generating congestion maps ----")
-        generate_congestion_maps(
-            base_dir=base_dir,
-            network_xml=net_path,
-            edgedata_with=paths["edgedata_with"],
-            edgedata_wout=paths["edgedata_wout"],
-            output_with=paths["congestion_map_with"],
-            output_wout=paths["congestion_map_wout"],
-        )
-        
-        # 6) Calculate metrics
-        print("---- calculating metrics without closed edges ----")
-        metrics_without = calculate_metrics(
-            tripinfo_path=paths["tripinfo_wout"],
-            edgedata_path=paths["edgedata_wout"],
-            routes_path=paths["routes_xml"],
-            baseline_tripinfo_path=None,
-        )
-        print("---- calculating metrics with closed edges ----")    
-        metrics_with = calculate_metrics(
-            tripinfo_path=paths["tripinfo_with"],
-            edgedata_path=paths["edgedata_with"],
-            routes_path=paths["routes_xml"],
-            baseline_tripinfo_path=paths["tripinfo_wout"],
-        )
-        
-        comparison = calculate_scenario_comparison(metrics_with, metrics_without)
-        
-        # Compile all metrics into a comprehensive report
-        metrics_report = {
-            "scenario_without_closures": metrics_without,
-            "scenario_with_closures": metrics_with,
-            "comparison": comparison,
-            "metadata": {
-                "begin_time": begin_time,
-                "end_time": end_time,
-                "simulation_duration_s": end_time - begin_time,
-                "insertion_rate": insertion_rate,
-                "closed_edges": [str(e) for e in closed_edges],
-                "num_closed_edges": len(closed_edges),
-            }
-        }
-        
-        # Write metrics to JSON file
-        metrics_json_path = paths["output_dir"] / "metrics.json"
-        with open(metrics_json_path, "w", encoding="utf-8") as mf:
-            json.dump(metrics_report, mf, indent=2)
+                # Save the network XML to the output directory
+                net_path = paths["output_dir"] / "simulation.net.xml"
+                with open(net_path, "w", encoding="utf-8") as f:
+                    f.write(net_xml_content)
+                
+                # 1) Rerouters (only if closed edges provided)
+                print("---- generating rerouters ----")
+                generate_rerouters(
+                    network=net_path,
+                    closed_edges=[str(e) for e in closed_edges],
+                    begin=begin_time,
+                    end=end_time,
+                    out_xml=paths["rerouter_file"],
+                )
+                
+                # 2) Trips and routes - check if routes_zip was provided
+                print("---- handling routes ----")
+                if 'routes_zip' in request.files and request.files['routes_zip'].filename != '':
+                    print("---- extracting uploaded routes ----")
+                    routes_zip_file = request.files['routes_zip']
+                    routes_zip_bytes = BytesIO(routes_zip_file.read())
+                    
+                    with ZipFile(routes_zip_bytes, 'r') as rzf:
+                        routes_xml_files = [name for name in rzf.namelist() if name.endswith('.xml')]
+                        if not routes_xml_files:
+                            return jsonify({"error": "No .xml file found in the uploaded routes ZIP"}), 400
+                        
+                        routes_xml_filename = routes_xml_files[0]
+                        routes_xml_content = rzf.read(routes_xml_filename).decode('utf-8')
+                    
+                    # Save the routes XML
+                    routes_xml = paths["output_dir"] / "uploaded_routes.xml"
+                    with open(routes_xml, "w", encoding="utf-8") as f:
+                        f.write(routes_xml_content)
+                else:
+                    print("---- generating random trips and routes ----")
+                    generate_random_trips(
+                        network=net_path,
+                        begin=begin_time,
+                        end=end_time,
+                        insertion_rate=insertion_rate,
+                        routes_xml=paths["routes_xml"],
+                        trips_xml=paths["trips_xml"],
+                    )
+                    routes_xml = paths["routes_xml"]
+                print("---- running sumo with closed edges ----")
+                # 3) SUMO simulations
+                run_sumo(
+                    network=net_path,
+                    routes_xml=routes_xml,
+                    begin=begin_time,
+                    end=end_time,
+                    fcd_out=paths["fcd_with"],
+                    tripinfo_out=paths["tripinfo_with"],
+                    edgedata_out=paths["edgedata_with"],
+                    rerouter_xml=paths["rerouter_file"] if closed_edges else None,
+                    fcd_filter_shape=fcd_filter_shape,
+                    output_dir=paths["output_dir"],
+                    
+                )
+                print("---- running sumo without closed edges ----")
+                run_sumo(
+                    network=net_path,
+                    routes_xml=routes_xml,
+                    begin=begin_time,
+                    end=end_time,
+                    fcd_out=paths["fcd_wout"],
+                    tripinfo_out=paths["tripinfo_wout"],
+                    edgedata_out=paths["edgedata_wout"],
+                    rerouter_xml=None,
+                    fcd_filter_shape=fcd_filter_shape,
+                    output_dir=paths["output_dir"],
+                )
+                print("---- converting outputs ----")
+                # 4) Convert outputs
+                convert_fcd_to_outputs(
+                    base_dir=base_dir,
+                    fcd_with=paths["fcd_with"],
+                    fcd_wout=paths["fcd_wout"],
+                    trips_json_with=paths["fcd_trips_json_with"],
+                    trips_json_wout=paths["fcd_trips_json_wout"],
+                    insertion_rate=insertion_rate,
+                    closed_edges=[str(e) for e in closed_edges],
+                    network_xml=net_path,
+                )
 
-        # Create in-memory ZIP of all output files
-        memory_file = BytesIO()
-        with ZipFile(memory_file, mode="w", compression=ZIP_DEFLATED) as zf:
-            zf.write(paths["fcd_trips_json_with"], arcname=paths["fcd_trips_json_with"].name)
-            zf.write(paths["fcd_trips_json_wout"], arcname=paths["fcd_trips_json_wout"].name)
-            zf.write(metrics_json_path, arcname="metrics.json")
-            zf.write(paths["congestion_map_with"], arcname="congestion_with.geojson")
-            zf.write(paths["congestion_map_wout"], arcname="congestion_without.geojson")
-        memory_file.seek(0)
+                # 5) Generate congestion maps
+                print("---- generating congestion maps ----")
+                generate_congestion_maps(
+                    base_dir=base_dir,
+                    network_xml=net_path,
+                    edgedata_with=paths["edgedata_with"],
+                    edgedata_wout=paths["edgedata_wout"],
+                    output_with=paths["congestion_map_with"],
+                    output_wout=paths["congestion_map_wout"],
+                )
+                
+                # 6) Calculate metrics
+                print("---- calculating metrics without closed edges ----")
+                metrics_without = calculate_metrics(
+                    tripinfo_path=paths["tripinfo_wout"],
+                    edgedata_path=paths["edgedata_wout"],
+                    routes_path=paths["routes_xml"],
+                    baseline_tripinfo_path=None,
+                )
+                print("---- calculating metrics with closed edges ----")    
+                metrics_with = calculate_metrics(
+                    tripinfo_path=paths["tripinfo_with"],
+                    edgedata_path=paths["edgedata_with"],
+                    routes_path=paths["routes_xml"],
+                    baseline_tripinfo_path=paths["tripinfo_wout"],
+                )
+                
+                comparison = calculate_scenario_comparison(metrics_with, metrics_without)
+                
+                # Compile all metrics into a comprehensive report
+                metrics_report = {
+                    "scenario_without_closures": metrics_without,
+                    "scenario_with_closures": metrics_with,
+                    "comparison": comparison,
+                    "metadata": {
+                        "begin_time": begin_time,
+                        "end_time": end_time,
+                        "simulation_duration_s": end_time - begin_time,
+                        "insertion_rate": insertion_rate,
+                        "closed_edges": [str(e) for e in closed_edges],
+                        "num_closed_edges": len(closed_edges),
+                    }
+                }
+                
+                # Write metrics to JSON file
+                metrics_json_path = paths["output_dir"] / "metrics.json"
+                with open(metrics_json_path, "w", encoding="utf-8") as mf:
+                    json.dump(metrics_report, mf, indent=2)
 
-        return send_file(
-            memory_file,
-            mimetype="application/zip",
-            as_attachment=True,
-            download_name="simulation_outputs.zip",
-        )
+                # Create in-memory ZIP of all output files
+                memory_file = BytesIO()
+                with ZipFile(memory_file, mode="w", compression=ZIP_DEFLATED) as zf:
+                    zf.write(paths["fcd_trips_json_with"], arcname=paths["fcd_trips_json_with"].name)
+                    zf.write(paths["fcd_trips_json_wout"], arcname=paths["fcd_trips_json_wout"].name)
+                    zf.write(metrics_json_path, arcname="metrics.json")
+                    zf.write(paths["congestion_map_with"], arcname="congestion_with.geojson")
+                    zf.write(paths["congestion_map_wout"], arcname="congestion_without.geojson")
+                memory_file.seek(0)
+
+                return send_file(
+                    memory_file,
+                    mimetype="application/zip",
+                    as_attachment=True,
+                    download_name="simulation_outputs.zip",
+                )
 
     except subprocess.CalledProcessError as e:
         raise e
@@ -511,6 +520,7 @@ def get_current_deviations() -> Any:
       - net_geojson_path: override path to net.geojson (default: <this_dir>/net.geojson)
       - wfs_url: override WFS URL
     """
+    print("---- getting current deviations ----")
     try:
         net_geojson_path = "brussels.geojson"
         with open(net_geojson_path, "r", encoding="utf-8") as f:
@@ -535,7 +545,7 @@ def generate_network_from_bounding_box() -> Any:
       - corners: List[{lat, lon}] (at least 4) OR
       - bbox: [min_lon, min_lat, max_lon, max_lat] OR
       - bbox: {min_lon, min_lat, max_lon, max_lat}
-      - output_dir: optional directory to persist the generated osm.net.xml (default 'output')
+      - output_dir: (Ignored in concurrent mode) optional directory to persist the generated osm.net.xml (default 'output')
     
     Returns:
       - ZIP file containing:
@@ -553,45 +563,39 @@ def generate_network_from_bounding_box() -> Any:
         base_dir = Path(__file__).resolve().parent
         bbox = parse_bbox_from_payload(payload)
 
-        # Determine persistent output directory for the SUMO net
-        output_dir_value = payload.get("output_dir", "output")
-        output_dir_path = Path(output_dir_value)
-        if not output_dir_path.is_absolute():
-            output_dir_path = base_dir / output_dir_path
-        output_dir_path.mkdir(parents=True, exist_ok=True)
+        with SIMULATION_LOCK:
+            with tempfile.TemporaryDirectory() as tmpd:
+                tmp_path = Path(tmpd)
 
-        with tempfile.TemporaryDirectory() as tmpd:
-            tmp_path = Path(tmpd)
+                osm_input_path = fetch_osm_with_osmget(bbox, tmp_path)
 
-            osm_input_path = fetch_osm_with_osmget(bbox, tmp_path)
+                # Save net.xml to the temp path
+                net_xml_path = tmp_path / "uploaded.net.xml"
+                generate_network(osm_input_path, net_xml_path)
 
-            # Save net.xml to the same path as generate_network_geojson
-            net_xml_path = output_dir_path / "uploaded.net.xml"
-            generate_network(osm_input_path, net_xml_path)
+                # Save geojson to the temp path
+                geojson_path = tmp_path / "network.geojson"
+                generate_geojson_from_net(net_xml_path, geojson_path)
 
-            # Save geojson to the same path as generate_network_geojson
-            geojson_path = output_dir_path / "network.geojson"
-            generate_geojson_from_net(net_xml_path, geojson_path)
+                # Create metadata
+                metadata = {
+                    "net_xml_path": "network.net.xml"
+                }
+                
+                # Create in-memory ZIP
+                memory_file = BytesIO()
+                with ZipFile(memory_file, mode="w", compression=ZIP_DEFLATED) as zf:
+                    zf.write(net_xml_path, arcname="network.net.xml")
+                    zf.write(geojson_path, arcname="network.geojson")
+                    zf.writestr("metadata.json", json.dumps(metadata, indent=2))
+                memory_file.seek(0)
 
-            # Create metadata
-            metadata = {
-                "net_xml_path": str(net_xml_path.relative_to(base_dir))
-            }
-            
-            # Create in-memory ZIP
-            memory_file = BytesIO()
-            with ZipFile(memory_file, mode="w", compression=ZIP_DEFLATED) as zf:
-                zf.write(net_xml_path, arcname="network.net.xml")
-                zf.write(geojson_path, arcname="network.geojson")
-                zf.writestr("metadata.json", json.dumps(metadata, indent=2))
-            memory_file.seek(0)
-
-            return send_file(
-                memory_file,
-                mimetype="application/zip",
-                as_attachment=True,
-                download_name="network.zip",
-            )
+                return send_file(
+                    memory_file,
+                    mimetype="application/zip",
+                    as_attachment=True,
+                    download_name="network.zip",
+                )
 
     except subprocess.CalledProcessError as e:
         return json_error_response(e, 500)
@@ -626,50 +630,50 @@ def generate_network_geojson() -> Any:
 
         base_dir = Path(__file__).resolve().parent
         
-        # Determine output directory
-        output_dir_path = base_dir / "output"
-        output_dir_path.mkdir(parents=True, exist_ok=True)
+        with SIMULATION_LOCK:
+            with tempfile.TemporaryDirectory() as tmp_dir_str:
+                tmp_dir = Path(tmp_dir_str)
 
-        # Read and extract the ZIP file
-        zip_bytes = BytesIO(zip_file.read())
-        with ZipFile(zip_bytes, 'r') as zf:
-            # Find the .net.xml file in the zip
-            xml_files = [name for name in zf.namelist() if name.endswith('.net.xml')]
-            if not xml_files:
-                return jsonify({"error": "No .net.xml file found in the uploaded ZIP"}), 400
-            
-            # Extract the first .net.xml file
-            xml_filename = xml_files[0]
-            net_xml_content = zf.read(xml_filename).decode('utf-8')
+                # Read and extract the ZIP file
+                zip_bytes = BytesIO(zip_file.read())
+                with ZipFile(zip_bytes, 'r') as zf:
+                    # Find the .net.xml file in the zip
+                    xml_files = [name for name in zf.namelist() if name.endswith('.net.xml')]
+                    if not xml_files:
+                        return jsonify({"error": "No .net.xml file found in the uploaded ZIP"}), 400
+                    
+                    # Extract the first .net.xml file
+                    xml_filename = xml_files[0]
+                    net_xml_content = zf.read(xml_filename).decode('utf-8')
 
-        # Save the uploaded XML to a file
-        net_xml_path = output_dir_path / "uploaded.net.xml"
-        with open(net_xml_path, "w", encoding="utf-8") as f:
-            f.write(net_xml_content)
+                # Save the uploaded XML to a file
+                net_xml_path = tmp_dir / "uploaded.net.xml"
+                with open(net_xml_path, "w", encoding="utf-8") as f:
+                    f.write(net_xml_content)
 
-        # Generate GeoJSON from the network
-        geojson_path = output_dir_path / "network.geojson"
-        generate_geojson_from_net(net_xml_path, geojson_path)
+                # Generate GeoJSON from the network
+                geojson_path = tmp_dir / "network.geojson"
+                generate_geojson_from_net(net_xml_path, geojson_path)
 
-        # Create metadata
-        metadata = {
-            "net_xml_path": str(net_xml_path.relative_to(base_dir))
-        }
-        
-        # Create in-memory ZIP
-        memory_file = BytesIO()
-        with ZipFile(memory_file, mode="w", compression=ZIP_DEFLATED) as zf:
-            zf.write(net_xml_path, arcname="network.net.xml")
-            zf.write(geojson_path, arcname="network.geojson")
-            zf.writestr("metadata.json", json.dumps(metadata, indent=2))
-        memory_file.seek(0)
+                # Create metadata
+                metadata = {
+                    "net_xml_path": "network.net.xml"
+                }
+                
+                # Create in-memory ZIP
+                memory_file = BytesIO()
+                with ZipFile(memory_file, mode="w", compression=ZIP_DEFLATED) as zf:
+                    zf.write(net_xml_path, arcname="network.net.xml")
+                    zf.write(geojson_path, arcname="network.geojson")
+                    zf.writestr("metadata.json", json.dumps(metadata, indent=2))
+                memory_file.seek(0)
 
-        return send_file(
-            memory_file,
-            mimetype="application/zip",
-            as_attachment=True,
-            download_name="network.zip",
-        )
+                return send_file(
+                    memory_file,
+                    mimetype="application/zip",
+                    as_attachment=True,
+                    download_name="network.zip",
+                )
 
     except subprocess.CalledProcessError as e:
         return json_error_response(e, 500)

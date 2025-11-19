@@ -1,5 +1,5 @@
 [project]
-name = "scenario-generator-tt"
+name = "demo-mlg-traffic-twin-backend"
 version = "0.1.0"
 description = "Traffic scenario generator backend (Flask) with multiple standalone modules"
 requires-python = ">=3.9"

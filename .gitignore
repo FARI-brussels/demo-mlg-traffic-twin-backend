@@ -4,3 +4,5 @@ network_generator/belgium-latest.osm.pbf
 network_generator/brussels.net.xml
 __pycache__/
 output/
+.venv/
+demo_mlg_traffic_twin_backend.egg-info

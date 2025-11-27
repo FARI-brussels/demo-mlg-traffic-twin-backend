@@ -10,8 +10,10 @@ from zipfile import ZipFile, ZIP_DEFLATED
 from typing import List, Optional, Dict, Any
 import traceback
 
-from flask import Flask, request, jsonify, send_file
-from flask_cors import CORS
+from fastapi import FastAPI, Request, UploadFile, File, Form, HTTPException, Response
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import BaseModel, Json
 
 # Import from our custom modules
 from extract_osm import (
@@ -28,8 +30,15 @@ from generate_filter_polygon import generate_circle_polygon, create_poly_xml
 
 GEOJSON_PATH = "net.geojson"
 
-app = Flask(__name__)
-CORS(app)
+app = FastAPI(title="Traffic Scenario Generator")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # Global lock for simulation to queue requests and prevent concurrent SUMO issues
 SIMULATION_LOCK = threading.Lock()
@@ -61,7 +70,6 @@ def ensure_env() -> None:
 def shutil_which(cmd: str) -> Optional[str]:
     # Minimal which implementation to avoid importing shutil for a single call
     paths = os.environ.get("PATH", "").split(os.pathsep)
-    exts = [""]
     for p in paths:
         candidate = Path(p) / cmd
         if candidate.is_file() and os.access(str(candidate), os.X_OK):
@@ -261,72 +269,75 @@ def convert_fcd_to_outputs(base_dir: Path, fcd_with: Path, fcd_wout: Path, trips
         ],
     )
 
-
-def json_error_response(e: Exception, status_code: int = 500):
-    tb = traceback.format_exc()
-    payload: Dict[str, Any] = {
-        "error": str(e),
-        "error_type": type(e).__name__,
-        "error_stack": tb,
-    }
-    if isinstance(e, subprocess.CalledProcessError):
-        cmd_list = e.cmd if isinstance(e.cmd, list) else [str(e.cmd)]
-        payload.update({
+# Error handling setup
+@app.exception_handler(subprocess.CalledProcessError)
+async def subprocess_error_handler(request: Request, exc: subprocess.CalledProcessError):
+    cmd_list = exc.cmd if isinstance(exc.cmd, list) else [str(exc.cmd)]
+    return JSONResponse(
+        status_code=500,
+        content={
+            "error": str(exc),
+            "error_type": type(exc).__name__,
             "cmd": " ".join(cmd_list),
-            "returncode": e.returncode,
-            "stdout": e.stdout,
-            "stderr": e.stderr,
-        })
-    return jsonify(payload), status_code
+            "returncode": exc.returncode,
+            "stdout": exc.stdout,
+            "stderr": exc.stderr,
+        }
+    )
 
-@app.route("/simulate", methods=["POST"])
-def simulate() -> Any:
+@app.exception_handler(Exception)
+async def generic_error_handler(request: Request, exc: Exception):
+    tb = traceback.format_exc()
+    return JSONResponse(
+        status_code=500,
+        content={
+            "error": str(exc),
+            "error_type": type(exc).__name__,
+            "error_stack": tb,
+        }
+    )
+
+
+@app.post("/simulate")
+def simulate(
+    network_zip: UploadFile = File(...),
+    begin_time: int = Form(...),
+    end_time: int = Form(...),
+    insertion_rate: int = Form(3000),
+    closed_edges: str = Form("[]"),
+    routes_zip: Optional[UploadFile] = File(None),
+    fcd_filter_shape: Optional[str] = Form(None)
+) -> Any:
     """
-    Run a minimal SUMO pipeline to produce four files and return them as a ZIP:
-      - fcd_trips_with.json
-      - fcd_trips_without.json
-
-    Request form-data fields:
-      - network_zip: ZIP file containing network.net.xml (required)
-      - begin_time: int (seconds) (required)
-      - end_time: int (seconds) (required)
-      - insertion_rate: int (optional, default 3000, used only if routes_zip not provided)
-      - closed_edges: JSON string array (optional)
-      - routes_zip: ZIP file containing routes.xml (optional, if not provided, random routes will be generated)
-      - fcd_filter_shape: JSON object with centerLon, centerLat, radiusKm (optional, filters FCD output to circular area)
+    Run a minimal SUMO pipeline to produce four files and return them as a ZIP.
     """
     # Base dir is the directory containing this file
     base_dir = Path(__file__).resolve().parent
 
     try:
         ensure_env()
-
-        # Check if network zip was uploaded
-        if 'network_zip' not in request.files:
-            return jsonify({"error": "network_zip file is required"}), 400
-
-        zip_file = request.files['network_zip']
-        if zip_file.filename == '':
-            return jsonify({"error": "No network file selected"}), 400
-
-        # Parse form data
-        begin_time = int(request.form.get("begin_time"))
-        end_time = int(request.form.get("end_time"))
-        insertion_rate = int(request.form.get("insertion_rate", 3000))
         
-        closed_edges_str = request.form.get("closed_edges", "[]")
-        closed_edges = json.loads(closed_edges_str)
-        if not isinstance(closed_edges, list):
-            return jsonify({"error": "closed_edges must be a list of strings"}), 400
+        # Validate network_zip
+        if not network_zip.filename:
+             raise HTTPException(status_code=400, detail="No network file selected")
+
+        # Parse JSON fields from Form data
+        try:
+            closed_edges_list = json.loads(closed_edges)
+            if not isinstance(closed_edges_list, list):
+                raise ValueError("closed_edges must be a list of strings")
+        except json.JSONDecodeError:
+             raise HTTPException(status_code=400, detail="Invalid JSON in closed_edges")
         
-        # Parse optional circular filter shape for FCD filtering
-        fcd_filter_shape = None
-        fcd_shape_str = request.form.get("fcd_filter_shape", None)
-        if fcd_shape_str:
-            fcd_filter_shape = json.loads(fcd_shape_str)
-            if not isinstance(fcd_filter_shape, dict):
-                return jsonify({"error": "fcd_filter_shape must be an object"}), 400
-        
+        fcd_filter_shape_dict = None
+        if fcd_filter_shape:
+            try:
+                fcd_filter_shape_dict = json.loads(fcd_filter_shape)
+                if not isinstance(fcd_filter_shape_dict, dict):
+                    raise ValueError("fcd_filter_shape must be an object")
+            except json.JSONDecodeError:
+                raise HTTPException(status_code=400, detail="Invalid JSON in fcd_filter_shape")
+
         # Use global lock to enforce serial execution
         with SIMULATION_LOCK:
             # Use temporary directory for request isolation
@@ -337,11 +348,11 @@ def simulate() -> Any:
                 paths = build_output_paths(tmp_dir)
                 
                 # Extract the network XML from the uploaded ZIP
-                zip_bytes = BytesIO(zip_file.read())
+                zip_bytes = BytesIO(network_zip.file.read())
                 with ZipFile(zip_bytes, 'r') as zf:
                     xml_files = [name for name in zf.namelist() if name.endswith('.net.xml')]
                     if not xml_files:
-                        return jsonify({"error": "No .net.xml file found in the uploaded ZIP"}), 400
+                        raise HTTPException(status_code=400, detail="No .net.xml file found in the uploaded ZIP")
                     
                     xml_filename = xml_files[0]
                     net_xml_content = zf.read(xml_filename).decode('utf-8')
@@ -355,7 +366,7 @@ def simulate() -> Any:
                 print("---- generating rerouters ----")
                 generate_rerouters(
                     network=net_path,
-                    closed_edges=[str(e) for e in closed_edges],
+                    closed_edges=[str(e) for e in closed_edges_list],
                     begin=begin_time,
                     end=end_time,
                     out_xml=paths["rerouter_file"],
@@ -363,15 +374,14 @@ def simulate() -> Any:
                 
                 # 2) Trips and routes - check if routes_zip was provided
                 print("---- handling routes ----")
-                if 'routes_zip' in request.files and request.files['routes_zip'].filename != '':
+                if routes_zip and routes_zip.filename:
                     print("---- extracting uploaded routes ----")
-                    routes_zip_file = request.files['routes_zip']
-                    routes_zip_bytes = BytesIO(routes_zip_file.read())
+                    routes_zip_bytes = BytesIO(routes_zip.file.read())
                     
                     with ZipFile(routes_zip_bytes, 'r') as rzf:
                         routes_xml_files = [name for name in rzf.namelist() if name.endswith('.xml')]
                         if not routes_xml_files:
-                            return jsonify({"error": "No .xml file found in the uploaded routes ZIP"}), 400
+                            raise HTTPException(status_code=400, detail="No .xml file found in the uploaded routes ZIP")
                         
                         routes_xml_filename = routes_xml_files[0]
                         routes_xml_content = rzf.read(routes_xml_filename).decode('utf-8')
@@ -391,6 +401,7 @@ def simulate() -> Any:
                         trips_xml=paths["trips_xml"],
                     )
                     routes_xml = paths["routes_xml"]
+
                 print("---- running sumo with closed edges ----")
                 # 3) SUMO simulations
                 run_sumo(
@@ -401,8 +412,8 @@ def simulate() -> Any:
                     fcd_out=paths["fcd_with"],
                     tripinfo_out=paths["tripinfo_with"],
                     edgedata_out=paths["edgedata_with"],
-                    rerouter_xml=paths["rerouter_file"] if closed_edges else None,
-                    fcd_filter_shape=fcd_filter_shape,
+                    rerouter_xml=paths["rerouter_file"] if closed_edges_list else None,
+                    fcd_filter_shape=fcd_filter_shape_dict,
                     output_dir=paths["output_dir"],
                     
                 )
@@ -416,7 +427,7 @@ def simulate() -> Any:
                     tripinfo_out=paths["tripinfo_wout"],
                     edgedata_out=paths["edgedata_wout"],
                     rerouter_xml=None,
-                    fcd_filter_shape=fcd_filter_shape,
+                    fcd_filter_shape=fcd_filter_shape_dict,
                     output_dir=paths["output_dir"],
                 )
                 print("---- converting outputs ----")
@@ -428,7 +439,7 @@ def simulate() -> Any:
                     trips_json_with=paths["fcd_trips_json_with"],
                     trips_json_wout=paths["fcd_trips_json_wout"],
                     insertion_rate=insertion_rate,
-                    closed_edges=[str(e) for e in closed_edges],
+                    closed_edges=[str(e) for e in closed_edges_list],
                     network_xml=net_path,
                 )
 
@@ -471,8 +482,8 @@ def simulate() -> Any:
                         "end_time": end_time,
                         "simulation_duration_s": end_time - begin_time,
                         "insertion_rate": insertion_rate,
-                        "closed_edges": [str(e) for e in closed_edges],
-                        "num_closed_edges": len(closed_edges),
+                        "closed_edges": [str(e) for e in closed_edges_list],
+                        "num_closed_edges": len(closed_edges_list),
                     }
                 }
                 
@@ -491,77 +502,52 @@ def simulate() -> Any:
                     zf.write(paths["congestion_map_wout"], arcname="congestion_without.geojson")
                 memory_file.seek(0)
 
-                return send_file(
-                    memory_file,
-                    mimetype="application/zip",
-                    as_attachment=True,
-                    download_name="simulation_outputs.zip",
+                return Response(
+                    content=memory_file.getvalue(),
+                    media_type="application/zip",
+                    headers={"Content-Disposition": "attachment; filename=simulation_outputs.zip"}
                 )
 
     except subprocess.CalledProcessError as e:
         raise e
-        return json_error_response(e, 500)
     except Exception as e:
         raise e
-        return json_error_response(e, 500)
 
 
-@app.route("/get_current_deviations", methods=["GET"])
-def get_current_deviations() -> Any:
-    """Fetch current traffic events and return GeoJSON of closed lanes mapped to network edges.
-
-    - Downloads WFS events from mobility.brussels.
-    - Filters for French consequences containing "Les deux directions fermées".
-    - Matches each event point to the nearest edge from net.geojson.
-    - Also includes the nearest opposite-direction edge based on id inversion.
-    - Returns FeatureCollection of those edges with closure metadata.
-
-    Optional query params:
-      - net_geojson_path: override path to net.geojson (default: <this_dir>/net.geojson)
-      - wfs_url: override WFS URL
-    """
+@app.get("/get_current_deviations")
+def get_current_deviations(wfs_url: Optional[str] = None) -> Any:
+    """Fetch current traffic events and return GeoJSON of closed lanes mapped to network edges."""
     print("---- getting current deviations ----")
     try:
         net_geojson_path = "brussels.geojson"
         with open(net_geojson_path, "r", encoding="utf-8") as f:
             net_geo = json.load(f)
 
-        wfs_url = request.args.get("wfs_url", None)
         closed_edges = fetch_closed_edges_from_brussels_api(net_geo, wfs_url)
 
-        return jsonify({
+        return {
             "type": "FeatureCollection",
             "features": closed_edges,
-        })
+        }
     except Exception as e:
-        return json_error_response(e, 500)
+        raise e
 
 
-@app.route("/generate_network_from_bounding_box", methods=["POST"])
-def generate_network_from_bounding_box() -> Any:
-    """Generate a network from OSM data for a given bounding box.
+class NetworkGenerationPayload(BaseModel):
+    corners: Optional[List[Dict[str, float]]] = None
+    bbox: Optional[Any] = None # Can be list or dict
+    output_dir: Optional[str] = None
 
-    Request JSON fields:
-      - corners: List[{lat, lon}] (at least 4) OR
-      - bbox: [min_lon, min_lat, max_lon, max_lat] OR
-      - bbox: {min_lon, min_lat, max_lon, max_lat}
-      - output_dir: (Ignored in concurrent mode) optional directory to persist the generated osm.net.xml (default 'output')
-    
-    Returns:
-      - ZIP file containing:
-        - network.net.xml: the SUMO network file
-        - network.geojson: the GeoJSON representation
-        - metadata.json: path information
-    """
+@app.post("/generate_network_from_bounding_box")
+def generate_network_from_bounding_box(payload: NetworkGenerationPayload) -> Any:
+    """Generate a network from OSM data for a given bounding box."""
     try:
-        payload = request.get_json(force=True, silent=False)
-        if not isinstance(payload, dict):
-            return jsonify({"error": "Invalid JSON body"}), 400
-
         ensure_env()
 
-        base_dir = Path(__file__).resolve().parent
-        bbox = parse_bbox_from_payload(payload)
+        # Convert pydantic model to dict for compatibility
+        payload_dict = payload.model_dump()
+        
+        bbox = parse_bbox_from_payload(payload_dict)
 
         with SIMULATION_LOCK:
             with tempfile.TemporaryDirectory() as tmpd:
@@ -590,41 +576,26 @@ def generate_network_from_bounding_box() -> Any:
                     zf.writestr("metadata.json", json.dumps(metadata, indent=2))
                 memory_file.seek(0)
 
-                return send_file(
-                    memory_file,
-                    mimetype="application/zip",
-                    as_attachment=True,
-                    download_name="network.zip",
+                return Response(
+                    content=memory_file.getvalue(),
+                    media_type="application/zip",
+                    headers={"Content-Disposition": "attachment; filename=network.zip"}
                 )
 
     except subprocess.CalledProcessError as e:
-        return json_error_response(e, 500)
+        raise e
     except ValueError as e:
-        return jsonify({"error": str(e)}), 400
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        return json_error_response(e, 500)
+        raise e
 
-@app.route("/generate_network_geojson", methods=["POST"])
-def generate_network_geojson() -> Any:
-    """Generate a network geojson from uploaded zipped net.xml file.
-    
-    Request form-data:
-      - network_zip: ZIP file containing network.net.xml
-    
-    Returns:
-      - ZIP file containing:
-        - network.net.xml: the SUMO network file
-        - network.geojson: the GeoJSON representation
-        - metadata.json: path information
-    """
+
+@app.post("/generate_network_geojson")
+def generate_network_geojson(network_zip: UploadFile = File(...)) -> Any:
+    """Generate a network geojson from uploaded zipped net.xml file."""
     try:
-        # Check if a file was uploaded
-        if 'network_zip' not in request.files:
-            return jsonify({"error": "network_zip file is required"}), 400
-
-        zip_file = request.files['network_zip']
-        if zip_file.filename == '':
-            return jsonify({"error": "No file selected"}), 400
+        if not network_zip.filename:
+            raise HTTPException(status_code=400, detail="network_zip file is required")
 
         ensure_env()
 
@@ -635,12 +606,12 @@ def generate_network_geojson() -> Any:
                 tmp_dir = Path(tmp_dir_str)
 
                 # Read and extract the ZIP file
-                zip_bytes = BytesIO(zip_file.read())
+                zip_bytes = BytesIO(network_zip.file.read())
                 with ZipFile(zip_bytes, 'r') as zf:
                     # Find the .net.xml file in the zip
                     xml_files = [name for name in zf.namelist() if name.endswith('.net.xml')]
                     if not xml_files:
-                        return jsonify({"error": "No .net.xml file found in the uploaded ZIP"}), 400
+                         raise HTTPException(status_code=400, detail="No .net.xml file found in the uploaded ZIP")
                     
                     # Extract the first .net.xml file
                     xml_filename = xml_files[0]
@@ -668,25 +639,19 @@ def generate_network_geojson() -> Any:
                     zf.writestr("metadata.json", json.dumps(metadata, indent=2))
                 memory_file.seek(0)
 
-                return send_file(
-                    memory_file,
-                    mimetype="application/zip",
-                    as_attachment=True,
-                    download_name="network.zip",
+                return Response(
+                    content=memory_file.getvalue(),
+                    media_type="application/zip",
+                    headers={"Content-Disposition": "attachment; filename=network.zip"}
                 )
 
     except subprocess.CalledProcessError as e:
-        return json_error_response(e, 500)
+        raise e
     except Exception as e:
-        return json_error_response(e, 500)
-
-
-def main():
-    """Main entry point for the scenario generator backend."""
-    ensure_env()
-    port = int(os.environ.get("PORT", 8000))
-    app.run(host="0.0.0.0", port=port)
-
+        raise e
 
 if __name__ == "__main__":
-    main() 
+    import uvicorn
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
+

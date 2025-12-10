@@ -19,6 +19,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--network-xml", dest="network_xml", default=None, help="Path to network.net.xml for lane speed limits")
     # New metadata args
     parser.add_argument("--insertion-rate", dest="insertion_rate", type=int, default=None, help="Insertion rate used in simulation")
+    parser.add_argument("--begin-time", dest="begin_time", type=int, default=None, help="Begin time used in simulation")
+    parser.add_argument("--end-time", dest="end_time", type=int, default=None, help="End time used in simulation")      
     parser.add_argument(
         "--closed-edges",
         dest="closed_edges",
@@ -69,7 +71,7 @@ def _build_lane_speed_map(network_xml_path: Optional[str]) -> Dict[str, float]:
     return lane_speeds
 
 
-def convert(input_xml: str, output_json: str, min_points: int = 2, dedupe: bool = False, network_xml: Optional[str] = None, insertion_rate: Optional[int] = None, closed_edges: Optional[List[str]] = None, max_vehicles_in_memory: int = 10000) -> None:
+def convert(input_xml: str, output_json: str, min_points: int = 2, dedupe: bool = False, network_xml: Optional[str] = None, insertion_rate: Optional[int] = None, closed_edges: Optional[List[str]] = None, max_vehicles_in_memory: int = 10000, begin_time: Optional[int] = None, end_time: Optional[int] = None) -> None:
     # tracks[vehicle_id] -> list of (lon, lat, time, speed, angle, lane_id)
     tracks: Dict[str, List[Tuple[float, float, float, float, float, str]]] = defaultdict(list)
     
@@ -201,6 +203,8 @@ def convert(input_xml: str, output_json: str, min_points: int = 2, dedupe: bool 
     metadata = {
         "insertion_rate": insertion_rate,
         "closed_edges": list(closed_edges) if closed_edges else [],
+        "begin_time": begin_time,
+        "end_time": end_time,
     }
 
     with open(output_json, "w", encoding="utf-8") as f:
@@ -227,6 +231,8 @@ def main() -> None:
         network_xml=args.network_xml,
         insertion_rate=args.insertion_rate,
         closed_edges=closed_edges_list,
+        begin_time=args.begin_time,
+        end_time=args.end_time,
     )
 
 

@@ -62,16 +62,9 @@ def parse_bbox_from_payload(payload: Dict[str, Any]) -> List[float]:
     return [min_lon, min_lat, max_lon, max_lat]
 
 
-def ensure_osmium() -> None:
-    """Ensure the 'osmium' CLI is available in PATH."""
-    from backend import shutil_which
-    if not shutil_which("osmium"):
-        raise FileNotFoundError("Required binary 'osmium' not found in PATH")
-
 
 def extract_osm_from_pbf(pbf_path: Path, bbox: List[float], out_path: Path) -> None:
     """Use osmium to extract an OSM XML subset from a PBF file for the given bbox."""
-    ensure_osmium()
     min_lon, min_lat, max_lon, max_lat = bbox
     cmd = [
         "osmium", "extract",

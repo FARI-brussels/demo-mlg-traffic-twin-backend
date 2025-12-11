@@ -46,6 +46,12 @@ Before running the application, ensure you have the following installed:
         ```bash
         uv sync
         ```
+
+        If you want to install dev dependencies as well (for testing and stuff);
+        ```bash
+        uv sync --extra dev
+        ```
+
     *   Using `pip`:
         ```bash
         pip install -e .

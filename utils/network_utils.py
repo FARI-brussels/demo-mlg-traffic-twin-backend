@@ -1,6 +1,7 @@
 from pathlib import Path
 from utils.run_utils import run
 from typing import Dict
+import os
 
 def generate_network(osm_file: Path, net_out: Path) -> None:
     """Generate a SUMO network (.net.xml) from an OSM file using netconvert."""

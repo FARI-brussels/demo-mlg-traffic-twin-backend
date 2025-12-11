@@ -23,6 +23,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
   "pytest>=6.0.0",
+  "httpx>=0.23.0",
   "black>=22.0.0",
   "ruff>=0.1.0",
   "mypy>=0.950",
@@ -57,4 +58,10 @@ ignore = ["S101", "T201", "PLR0913", "PLR0912", "PLR0915", "COM812", "ISC001"]
 python_version = "3.9"
 warn_return_any = true
 warn_unused_configs = true
-disallow_untyped_defs = true 
+disallow_untyped_defs = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_functions = ["test_*"]
+addopts = "-v"

@@ -214,64 +214,88 @@ def calculate_metrics(
     }
 
 
-def calculate_scenario_comparison(
-    with_closure_metrics: Dict[str, Any],
-    without_closure_metrics: Dict[str, Any]
-) -> Dict[str, Any]:
-    """Calculate comparative metrics between scenarios.
+def calculate_multi_scenario_comparison(
+    scenario_metrics_list: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    """Calculate comparative metrics for multiple scenarios against the best scenario.
+    
+    The scenarios are expected to be sorted by total_delay_vh (ascending),
+    so the first scenario is the best (baseline for comparison).
     
     Args:
-        with_closure_metrics: Metrics from scenario with road closures
-        without_closure_metrics: Metrics from baseline scenario
+        scenario_metrics_list: List of metrics dicts, sorted by total_delay_vh (best first)
     
     Returns:
-        Dictionary with comparative metrics and deltas
+        List of comparison dicts, one per scenario (first one has all zeros as it's the baseline)
     """
-    def safe_delta(with_val: float, without_val: float) -> float:
-        """Calculate percentage change."""
-        if without_val == 0:
-            return 0.0
-        return ((with_val - without_val) / without_val) * 100.0
+    if not scenario_metrics_list:
+        return []
     
-    return {
-        "delay_increase_vh": round(
-            with_closure_metrics["total_delay_vh"] - without_closure_metrics["total_delay_vh"], 
-            2
-        ),
-        "delay_increase_pct": round(
-            safe_delta(
-                with_closure_metrics["total_delay_vh"],
-                without_closure_metrics["total_delay_vh"]
-            ),
-            2
-        ),
-        "travel_time_increase_min": round(
-            with_closure_metrics["avg_travel_time_min"] - without_closure_metrics["avg_travel_time_min"],
-            2
-        ),
-        "travel_time_increase_pct": round(
-            safe_delta(
-                with_closure_metrics["avg_travel_time_min"],
-                without_closure_metrics["avg_travel_time_min"]
-            ),
-            2
-        ),
-        "throughput_decrease_pct": round(
-            with_closure_metrics["throughput_pct"] - without_closure_metrics["throughput_pct"],
-            2
-        ),
-        "co2_increase_kg": round(
-            with_closure_metrics["co2_kg"] - without_closure_metrics["co2_kg"],
-            2
-        ),
-        "co2_increase_pct": round(
-            safe_delta(
-                with_closure_metrics["co2_kg"],
-                without_closure_metrics["co2_kg"]
-            ),
-            2
-        ),
-    }
+    def safe_delta(current_val: float, best_val: float) -> float:
+        """Calculate percentage change from best scenario."""
+        if best_val == 0:
+            return 0.0
+        return ((current_val - best_val) / best_val) * 100.0
+    
+    best_metrics = scenario_metrics_list[0]
+    comparisons = []
+    
+    for i, metrics in enumerate(scenario_metrics_list):
+        if i == 0:
+            # Best scenario - all deltas are zero
+            comparisons.append({
+                "is_best": True,
+                "delay_increase_vh": 0.0,
+                "delay_increase_pct": 0.0,
+                "travel_time_increase_min": 0.0,
+                "travel_time_increase_pct": 0.0,
+                "throughput_change_pct": 0.0,
+                "co2_increase_kg": 0.0,
+                "co2_increase_pct": 0.0,
+            })
+        else:
+            comparisons.append({
+                "is_best": False,
+                "delay_increase_vh": round(
+                    metrics["total_delay_vh"] - best_metrics["total_delay_vh"], 
+                    2
+                ),
+                "delay_increase_pct": round(
+                    safe_delta(
+                        metrics["total_delay_vh"],
+                        best_metrics["total_delay_vh"]
+                    ),
+                    2
+                ),
+                "travel_time_increase_min": round(
+                    metrics["avg_travel_time_min"] - best_metrics["avg_travel_time_min"],
+                    2
+                ),
+                "travel_time_increase_pct": round(
+                    safe_delta(
+                        metrics["avg_travel_time_min"],
+                        best_metrics["avg_travel_time_min"]
+                    ),
+                    2
+                ),
+                "throughput_change_pct": round(
+                    metrics["throughput_pct"] - best_metrics["throughput_pct"],
+                    2
+                ),
+                "co2_increase_kg": round(
+                    metrics["co2_kg"] - best_metrics["co2_kg"],
+                    2
+                ),
+                "co2_increase_pct": round(
+                    safe_delta(
+                        metrics["co2_kg"],
+                        best_metrics["co2_kg"]
+                    ),
+                    2
+                ),
+            })
+    
+    return comparisons
 
 
 if __name__ == "__main__":

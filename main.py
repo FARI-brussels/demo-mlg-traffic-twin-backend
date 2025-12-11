@@ -1,6 +1,5 @@
 import os
 import json
-import shlex
 import tempfile
 import subprocess
 import threading
@@ -14,8 +13,8 @@ import traceback
 
 from fastapi import FastAPI, Request, UploadFile, File, Form, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel, Json
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, field_validator
 
 # Import from our custom modules
 from extract_osm import (
@@ -26,10 +25,35 @@ from extract_osm import (
 from get_osiris_closed_edges import fetch_closed_edges_from_brussels_api
 from calculate_metrics import (
     calculate_metrics,
-    calculate_scenario_comparison
+    calculate_multi_scenario_comparison
 )
+
+
+# Scenario model for multi-scenario simulation
+class ScenarioInput(BaseModel):
+    """Input model for a single scenario in multi-scenario simulation."""
+    name: str
+    description: Optional[str] = None
+    closed_edges: List[str] = []
+    
+    @field_validator('name')
+    @classmethod
+    def name_not_empty(cls, v: str) -> str:
+        if not v or not v.strip():
+            raise ValueError('Scenario name cannot be empty')
+        return v.strip()
+    
+    @field_validator('closed_edges', mode='before')
+    @classmethod
+    def ensure_list(cls, v):
+        if v is None:
+            return []
+        return v
+
+
+MAX_SCENARIOS = 5
 # Note: generate_filter_polygon module is available if needed for FCD filtering
-from utils.run_utils import run_python_script, ensure_env, shutil_which, run
+from utils.run_utils import run_python_script, ensure_env, run
 from utils.network_utils import generate_network, extract_subnetwork, extract_demand_for_subnetwork
 from utils.sumo_utils import generate_rerouters, generate_random_trips
 
@@ -76,77 +100,96 @@ def build_output_paths(output_dir: Path, mode: SimulationMode = SimulationMode.M
         "output_dir": output_dir,
         "routes_xml": output_dir / "routes.xml",
         "trips_xml": output_dir / "trips.xml",
-        "rerouter_file": output_dir / "rerouters.xml",
-        "fcd_trips_json_with": output_dir / "fcd_trips_with.json",
-        "fcd_trips_json_wout": output_dir / "fcd_trips_without.json",
-        "congestion_map_with": output_dir / "congestion_with.geojson",
-        "congestion_map_wout": output_dir / "congestion_without.geojson",
     }
     
     if mode == SimulationMode.MICROSCOPIC:
         # Standard microscopic simulation paths
         paths.update({
             "sumo_network": output_dir / "osm.net.xml",
-            "fcd_with": output_dir / "fcd_with.out.xml",
-            "fcd_wout": output_dir / "fcd_without.out.xml",
-            "tripinfo_with": output_dir / "tripinfo_with.xml",
-            "tripinfo_wout": output_dir / "tripinfo_without.xml",
-            "edgedata_with": output_dir / "edgedata_with.xml",
-            "edgedata_wout": output_dir / "edgedata_without.xml",
         })
     
     elif mode == SimulationMode.MESOSCOPIC:
         # Mesoscopic simulation paths
         paths.update({
             "sumo_network": output_dir / "osm.net.xml",
-            "tripinfo_with": output_dir / "tripinfo_with.xml",
-            "tripinfo_wout": output_dir / "tripinfo_without.xml",
-            "edgedata_with": output_dir / "edgedata_with.xml",
-            "edgedata_wout": output_dir / "edgedata_without.xml",
-            "vehroute_with": output_dir / "vehroute_with.xml",
-            "vehroute_wout": output_dir / "vehroute_without.xml",
         })
     
     elif mode == SimulationMode.HYBRID:
-        # Hybrid simulation paths with mesoscopic and microscopic subdirectories
+        # Hybrid simulation paths
         meso_dir = output_dir / "mesoscopic"
         micro_dir = output_dir / "microscopic"
         meso_dir.mkdir(parents=True, exist_ok=True)
         micro_dir.mkdir(parents=True, exist_ok=True)
         
         paths.update({
-            # Full network
             "full_network": output_dir / "full_network.net.xml",
-            "sumo_network": output_dir / "full_network.net.xml",  # Alias for compatibility
-            
-            # Mesoscopic simulation outputs (with closures)
-            "meso_tripinfo_with": meso_dir / "tripinfo_with.xml",
-            "meso_edgedata_with": meso_dir / "edgedata_with.xml",
-            "meso_vehroute_with": meso_dir / "vehroute_with.xml",
-            # Mesoscopic simulation outputs (without closures)
-            "meso_tripinfo_wout": meso_dir / "tripinfo_without.xml",
-            "meso_edgedata_wout": meso_dir / "edgedata_without.xml",
-            "meso_vehroute_wout": meso_dir / "vehroute_without.xml",
-            
-            # Subnetwork
+            "sumo_network": output_dir / "full_network.net.xml",
             "sub_network": output_dir / "subnetwork.net.xml",
-            
-            # Extracted demand for microscopic simulation
-            "micro_routes_with": micro_dir / "routes_with.xml",
-            "micro_routes_wout": micro_dir / "routes_without.xml",
-            
-            # Rerouter for microscopic simulation (subnetwork-specific)
-            "micro_rerouter_file": micro_dir / "rerouters.xml",
-            
-            # Microscopic simulation outputs (with closures)
-            "micro_fcd_with": micro_dir / "fcd_with.out.xml",
-            "micro_tripinfo_with": micro_dir / "tripinfo_with.xml",
-            "micro_edgedata_with": micro_dir / "edgedata_with.xml",
-            # Microscopic simulation outputs (without closures)
-            "micro_fcd_wout": micro_dir / "fcd_without.out.xml",
-            "micro_tripinfo_wout": micro_dir / "tripinfo_without.xml",
-            "micro_edgedata_wout": micro_dir / "edgedata_without.xml",
+            "meso_dir": meso_dir,
+            "micro_dir": micro_dir,
         })
+    
+    return paths
+
+
+def build_scenario_paths(
+    output_dir: Path, 
+    scenario_name: str, 
+    mode: SimulationMode
+) -> Dict[str, Path]:
+    """Build output paths for a specific scenario.
+    
+    Args:
+        output_dir: Base output directory
+        scenario_name: Name of the scenario (sanitized for filesystem)
+        mode: Simulation mode
+    
+    Returns:
+        Dictionary of paths for this scenario's outputs
+    """
+    # Sanitize scenario name for filesystem
+    safe_name = "".join(c if c.isalnum() or c in '-_' else '_' for c in scenario_name)
+    scenario_dir = output_dir / f"scenario_{safe_name}"
+    scenario_dir.mkdir(parents=True, exist_ok=True)
+    
+    paths = {
+        "scenario_dir": scenario_dir,
+        "rerouter_file": scenario_dir / "rerouters.xml",
+        "fcd_trips_json": output_dir / f"fcd_trips_{safe_name}.json",
+        "congestion_map": output_dir / f"congestion_{safe_name}.geojson",
+    }
+    
+    if mode == SimulationMode.MICROSCOPIC:
+        paths.update({
+            "fcd": scenario_dir / "fcd.out.xml",
+            "tripinfo": scenario_dir / "tripinfo.xml",
+            "edgedata": scenario_dir / "edgedata.xml",
+        })
+    
+    elif mode == SimulationMode.MESOSCOPIC:
+        paths.update({
+            "tripinfo": scenario_dir / "tripinfo.xml",
+            "edgedata": scenario_dir / "edgedata.xml",
+            "vehroute": scenario_dir / "vehroute.xml",
+        })
+    
+    elif mode == SimulationMode.HYBRID:
+        meso_dir = scenario_dir / "mesoscopic"
+        micro_dir = scenario_dir / "microscopic"
+        meso_dir.mkdir(parents=True, exist_ok=True)
+        micro_dir.mkdir(parents=True, exist_ok=True)
+        
+        paths.update({
+            "meso_tripinfo": meso_dir / "tripinfo.xml",
+            "meso_edgedata": meso_dir / "edgedata.xml",
+            "meso_vehroute": meso_dir / "vehroute.xml",
+            "micro_routes": micro_dir / "routes.xml",
+            "micro_rerouter_file": micro_dir / "rerouters.xml",
+            "micro_fcd": micro_dir / "fcd.out.xml",
+            "micro_tripinfo": micro_dir / "tripinfo.xml",
+            "micro_edgedata": micro_dir / "edgedata.xml",
+        })
+    
     return paths
 
 
@@ -155,68 +198,123 @@ def build_output_paths(output_dir: Path, mode: SimulationMode = SimulationMode.M
 
 
 
-def compile_metrics_report(
-    tripinfo_with: Path,
-    tripinfo_wout: Path,
-    edgedata_with: Path,
-    edgedata_wout: Path,
+def compile_metrics_report_multi_scenario(
+    scenario_outputs: List[Dict[str, Any]],
     routes_xml: Path,
     simulation_mode: str,
     begin_time: int,
     end_time: int,
     insertion_rate: int,
-    closed_edges_list: List[str],
     extra_metadata: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Compile metrics report from simulation outputs."""
-    print("---- calculating metrics without closed edges ----")
-    metrics_without = calculate_metrics(
-        tripinfo_path=tripinfo_wout,
-        edgedata_path=edgedata_wout,
-        routes_path=routes_xml,
-        baseline_tripinfo_path=None,
+    """Compile metrics report from multiple scenario simulation outputs.
+    
+    Args:
+        scenario_outputs: List of dicts with keys:
+            - name: scenario name
+            - description: optional description
+            - closed_edges: list of closed edge IDs
+            - tripinfo_path: Path to tripinfo XML
+            - edgedata_path: Path to edgedata XML
+        routes_xml: Path to routes XML file
+        simulation_mode: Simulation mode used
+        begin_time: Simulation begin time
+        end_time: Simulation end time
+        insertion_rate: Vehicle insertion rate
+        extra_metadata: Additional metadata to include
+    
+    Returns:
+        Dict with scenarios sorted by total_delay_vh (best first) and comparisons
+    """
+    # Calculate metrics for each scenario
+    scenario_metrics = []
+    for scenario in scenario_outputs:
+        print(f"---- calculating metrics for scenario: {scenario['name']} ----")
+        metrics = calculate_metrics(
+            tripinfo_path=scenario['tripinfo_path'],
+            edgedata_path=scenario['edgedata_path'],
+            routes_path=routes_xml,
+            baseline_tripinfo_path=None,  # Will recalculate detours after sorting
+        )
+        scenario_metrics.append({
+            "name": scenario['name'],
+            "description": scenario.get('description'),
+            "closed_edges": scenario['closed_edges'],
+            "metrics": metrics,
+            "tripinfo_path": scenario['tripinfo_path'],  # Keep for detour calculation
+        })
+    
+    # Sort by total_delay_vh (ascending - lower delay is better)
+    scenario_metrics.sort(key=lambda x: x['metrics']['total_delay_vh'])
+    
+    # The best scenario (lowest delay) is now first
+    best_scenario = scenario_metrics[0]
+    best_tripinfo = best_scenario['tripinfo_path']
+    
+    # Recalculate metrics with detour relative to best scenario
+    for i, scenario in enumerate(scenario_metrics):
+        if i == 0:
+            # Best scenario - no detour calculation needed
+            scenario['metrics']['avg_detour_km'] = 0.0
+            scenario['rank'] = 1
+        else:
+            # Calculate detour relative to best scenario
+            metrics_with_detour = calculate_metrics(
+                tripinfo_path=scenario['tripinfo_path'],
+                edgedata_path=scenario_outputs[i]['edgedata_path'] if i < len(scenario_outputs) else scenario['tripinfo_path'].parent / "edgedata.xml",
+                routes_path=routes_xml,
+                baseline_tripinfo_path=best_tripinfo,
+            )
+            scenario['metrics']['avg_detour_km'] = metrics_with_detour['avg_detour_km']
+            scenario['rank'] = i + 1
+        
+        # Remove internal path from output
+        del scenario['tripinfo_path']
+    
+    # Calculate comparisons (deltas from best scenario)
+    comparisons = calculate_multi_scenario_comparison(
+        [s['metrics'] for s in scenario_metrics]
     )
     
-    print("---- calculating metrics with closed edges ----")
-    metrics_with = calculate_metrics(
-        tripinfo_path=tripinfo_with,
-        edgedata_path=edgedata_with,
-        routes_path=routes_xml,
-        baseline_tripinfo_path=tripinfo_wout,
-    )
-    
-    comparison = calculate_scenario_comparison(metrics_with, metrics_without)
-    
+    # Build metadata
     metadata = {
         "simulation_mode": simulation_mode,
         "begin_time": begin_time,
         "end_time": end_time,
         "simulation_duration_s": end_time - begin_time,
         "insertion_rate": insertion_rate,
-        "closed_edges": [str(e) for e in closed_edges_list],
-        "num_closed_edges": len(closed_edges_list),
+        "num_scenarios": len(scenario_metrics),
+        "best_scenario": best_scenario['name'],
     }
     
     if extra_metadata:
         metadata.update(extra_metadata)
     
     return {
-        "scenario_without_closures": metrics_without,
-        "scenario_with_closures": metrics_with,
-        "comparison": comparison,
+        "scenarios": scenario_metrics,
+        "comparisons": comparisons,
         "metadata": metadata,
     }
 
 
-def create_simulation_output_zip(
-    fcd_trips_json_with: Path,
-    fcd_trips_json_wout: Path,
+def create_simulation_output_zip_multi_scenario(
+    scenario_outputs: List[Dict[str, Any]],
     metrics_report: Dict[str, Any],
-    congestion_map_with: Path,
-    congestion_map_wout: Path,
     output_dir: Path,
 ) -> BytesIO:
-    """Create ZIP file with simulation outputs."""
+    """Create ZIP file with multi-scenario simulation outputs.
+    
+    Args:
+        scenario_outputs: List of dicts with keys:
+            - name: scenario name
+            - fcd_trips_json: Path to FCD trips JSON
+            - congestion_map: Path to congestion GeoJSON
+        metrics_report: Compiled metrics report
+        output_dir: Output directory for metrics JSON
+    
+    Returns:
+        In-memory ZIP file
+    """
     # Write metrics to JSON file
     metrics_json_path = output_dir / "metrics.json"
     with open(metrics_json_path, "w", encoding="utf-8") as mf:
@@ -225,63 +323,76 @@ def create_simulation_output_zip(
     # Create in-memory ZIP
     memory_file = BytesIO()
     with ZipFile(memory_file, mode="w", compression=ZIP_DEFLATED) as zf:
-        zf.write(fcd_trips_json_with, arcname="fcd_trips_with.json")
-        zf.write(fcd_trips_json_wout, arcname="fcd_trips_without.json")
         zf.write(metrics_json_path, arcname="metrics.json")
-        zf.write(congestion_map_with, arcname="congestion_with.geojson")
-        zf.write(congestion_map_wout, arcname="congestion_without.geojson")
-    memory_file.seek(0)
+        
+        for scenario in scenario_outputs:
+            safe_name = "".join(
+                c if c.isalnum() or c in '-_' else '_' 
+                for c in scenario['name']
+            )
+            
+            # Add FCD trips JSON
+            if scenario.get('fcd_trips_json') and scenario['fcd_trips_json'].exists():
+                zf.write(
+                    scenario['fcd_trips_json'], 
+                    arcname=f"fcd_trips_{safe_name}.json"
+                )
+            
+            # Add congestion map
+            if scenario.get('congestion_map') and scenario['congestion_map'].exists():
+                zf.write(
+                    scenario['congestion_map'], 
+                    arcname=f"congestion_{safe_name}.geojson"
+                )
     
+    memory_file.seek(0)
     return memory_file
 
 
-def generate_congestion_maps(base_dir: Path, network_xml: Path, edgedata_with: Path, edgedata_wout: Path, output_with: Path, output_wout: Path) -> None:
-    """Generate congestion map GeoJSONs from edgedata."""
+def generate_congestion_map(
+    base_dir: Path, 
+    network_xml: Path, 
+    edgedata: Path, 
+    output: Path
+) -> None:
+    """Generate congestion map GeoJSON from edgedata for a single scenario."""
     script = base_dir / "generate_congestion_map.py"
     if not script.exists():
         raise FileNotFoundError(f"Required script not found: {script}")
     
-    # Generate congestion map for scenario with closures
-    run_python_script(script, [str(network_xml), str(edgedata_with), str(output_with)])
-    
-    # Generate congestion map for scenario without closures
-    run_python_script(script, [str(network_xml), str(edgedata_wout), str(output_wout)])
+    run_python_script(script, [str(network_xml), str(edgedata), str(output)])
 
 
-def convert_fcd_to_outputs(base_dir: Path, fcd_with: Path, fcd_wout: Path, trips_json_with: Path, trips_json_wout: Path, insertion_rate: int, closed_edges: List[str], network_xml: Path, begin_time: int, end_time: int) -> None:
-    # Local conversion scripts live next to this backend
+def convert_fcd_to_json(
+    base_dir: Path,
+    fcd_xml: Path,
+    trips_json: Path,
+    network_xml: Path,
+    insertion_rate: int,
+    closed_edges: List[str],
+    begin_time: int,
+    end_time: int,
+    scenario_name: str = ""
+) -> None:
+    """Convert FCD XML to JSON for a single scenario."""
     fcd_to_trips = base_dir / "fcd_to_trips.py"
 
     if not fcd_to_trips.exists():
         raise FileNotFoundError(f"Required script not found: {fcd_to_trips}")
 
-    trips_args_common = ["--network-xml", str(network_xml)]
-    print("---- converting fcd to json with closed edges ----")
+    print(f"---- converting FCD to JSON for scenario: {scenario_name} ----")
     run_python_script(
         fcd_to_trips,
         [
-            str(fcd_with),
-            str(trips_json_with),
-            *trips_args_common,
+            str(fcd_xml),
+            str(trips_json),
+            "--network-xml", str(network_xml),
             "--insertion-rate", str(insertion_rate),
-            "--closed-edges", ",".join(closed_edges),
+            "--closed-edges", ",".join(closed_edges) if closed_edges else "",
             "--begin-time", str(begin_time),
             "--end-time", str(end_time),
         ],
     )
-    print("---- converting fcd to json without closed edges ----")
-    run_python_script(
-        fcd_to_trips,
-        [
-            str(fcd_wout),
-            str(trips_json_wout),
-            *trips_args_common,
-            "--insertion-rate", str(insertion_rate),
-            "--closed-edges", "",
-        ],
-    )
-
-
 
 
 def run_sumo_microscopic(
@@ -372,250 +483,6 @@ def run_sumo_mesoscopic(
     run(cmd)
 
 
-def run_hybrid_simulation(
-    base_dir: Path,
-    paths: Dict[str, Path],
-    net_path: Path,
-    routes_xml: Path,
-    begin_time: int,
-    end_time: int,
-    insertion_rate: int,
-    closed_edges_list: List[str],
-    fcd_filter_shape_dict: Dict[str, float],
-) -> Dict[str, Any]:
-    """Run the full hybrid simulation workflow.
-    
-    1. Run mesoscopic simulation for full network
-    2. Extract subnetwork around area of interest
-    3. Extract demand for vehicles passing through area
-    4. Run microscopic simulation on subnetwork
-    5. Combine outputs
-    
-    Returns metrics report dict.
-    """
-    print("=" * 60)
-    print("HYBRID SIMULATION MODE")
-    print("=" * 60)
-    
-    # ==========================================================================
-    # PHASE 1: Mesoscopic simulation on full network
-    # ==========================================================================
-    print("\n" + "=" * 60)
-    print("PHASE 1: MESOSCOPIC SIMULATION (Full Network)")
-    print("=" * 60)
-    
-    # Generate rerouters for closed edges (if any)
-    if closed_edges_list:
-        print("---- generating rerouters for mesoscopic ----")
-        generate_rerouters(
-            network=net_path,
-            closed_edges=[str(e) for e in closed_edges_list],
-            begin=begin_time,
-            end=end_time,
-            out_xml=paths["rerouter_file"],
-        )
-    
-    print("---- running mesoscopic simulation WITH closures ----")
-    run_sumo_mesoscopic(
-        network=net_path,
-        routes_xml=routes_xml,
-        begin=begin_time,
-        end=end_time,
-        tripinfo_out=paths["meso_tripinfo_with"],
-        edgedata_out=paths["meso_edgedata_with"],
-        vehroute_out=paths["meso_vehroute_with"],
-        rerouter_xml=paths["rerouter_file"] if closed_edges_list else None,
-    )
-    
-    print("---- running mesoscopic simulation WITHOUT closures ----")
-    run_sumo_mesoscopic(
-        network=net_path,
-        routes_xml=routes_xml,
-        begin=begin_time,
-        end=end_time,
-        tripinfo_out=paths["meso_tripinfo_wout"],
-        edgedata_out=paths["meso_edgedata_wout"],
-        vehroute_out=paths["meso_vehroute_wout"],
-        rerouter_xml=None,
-    )
-    
-    # ==========================================================================
-    # PHASE 2: Extract subnetwork around area of interest
-    # ==========================================================================
-    print("\n" + "=" * 60)
-    print("PHASE 2: SUBNETWORK EXTRACTION")
-    print("=" * 60)
-    
-    print(f"---- extracting subnetwork around ({fcd_filter_shape_dict['centerLon']:.4f}, {fcd_filter_shape_dict['centerLat']:.4f}) with radius {fcd_filter_shape_dict['radiusKm']}km ----")
-    extract_subnetwork(
-        full_network=net_path,
-        output_network=paths["sub_network"],
-        fcd_filter_shape=fcd_filter_shape_dict,
-        buffer_km=0  # Add 500m buffer around the area
-    )
-    
-    # ==========================================================================
-    # PHASE 3: Extract demand for microscopic simulation
-    # ==========================================================================
-    print("\n" + "=" * 60)
-    print("PHASE 3: DEMAND EXTRACTION")
-    print("=" * 60)
-    
-    print("---- extracting demand WITH closures ----")
-    vehicles_with = extract_demand_for_subnetwork(
-        vehroute_xml=paths["meso_vehroute_with"],
-        full_network=net_path,
-        sub_network=paths["sub_network"],
-        output_routes=paths["micro_routes_with"],
-        fcd_filter_shape=fcd_filter_shape_dict,
-        begin=begin_time,
-        end=end_time,
-    )
-    
-    print("---- extracting demand WITHOUT closures ----")
-    vehicles_wout = extract_demand_for_subnetwork(
-        vehroute_xml=paths["meso_vehroute_wout"],
-        full_network=net_path,
-        sub_network=paths["sub_network"],
-        output_routes=paths["micro_routes_wout"],
-        fcd_filter_shape=fcd_filter_shape_dict,
-        begin=begin_time,
-        end=end_time,
-    )
-    
-    # ==========================================================================
-    # PHASE 4: Microscopic simulation on subnetwork
-    # ==========================================================================
-    print("\n" + "=" * 60)
-    print("PHASE 4: MICROSCOPIC SIMULATION (Subnetwork)")
-    print("=" * 60)
-    
-    micro_output_dir = paths["output_dir"] / "microscopic"
-    
-    # Filter closed edges to only those that exist in the subnetwork
-    import sys
-    sumo_tools = Path(os.environ["SUMO_HOME"]) / "tools"
-    if str(sumo_tools) not in sys.path:
-        sys.path.append(str(sumo_tools))
-    import sumolib
-    
-    sub_net = sumolib.net.readNet(str(paths["sub_network"]))
-    sub_edge_ids = set(edge.getID() for edge in sub_net.getEdges())
-    
-    # Filter closed edges to only those in the subnetwork
-    micro_closed_edges = [e for e in closed_edges_list if e in sub_edge_ids]
-    print(f"Closed edges in full network: {len(closed_edges_list)}")
-    print(f"Closed edges in subnetwork: {len(micro_closed_edges)}")
-    if micro_closed_edges:
-        print(f"Subnetwork closed edges: {micro_closed_edges}")
-    
-    # Generate rerouter for subnetwork if there are closed edges in it
-    micro_rerouter_path = None
-    if micro_closed_edges:
-        print("---- generating rerouters for microscopic subnetwork ----")
-        generate_rerouters(
-            network=paths["sub_network"],
-            closed_edges=micro_closed_edges,
-            begin=begin_time,
-            end=end_time,
-            out_xml=paths["micro_rerouter_file"],
-        )
-        micro_rerouter_path = paths["micro_rerouter_file"]
-    
-    if vehicles_with > 0:
-        print("---- running microscopic simulation WITH closures ----")
-        run_sumo_microscopic(
-            network=paths["sub_network"],
-            routes_xml=paths["micro_routes_with"],
-            begin=begin_time,
-            end=end_time,
-            fcd_out=paths["micro_fcd_with"],
-            tripinfo_out=paths["micro_tripinfo_with"],
-            edgedata_out=paths["micro_edgedata_with"],
-            rerouter_xml=micro_rerouter_path,
-        )
-    else:
-        print("---- WARNING: No vehicles extracted for WITH closures scenario ----")
-        # Create empty FCD file
-        with open(paths["micro_fcd_with"], 'w') as f:
-            f.write('<?xml version="1.0" encoding="UTF-8"?>\n<fcd-export/>\n')
-    
-    if vehicles_wout > 0:
-        print("---- running microscopic simulation WITHOUT closures ----")
-        run_sumo_microscopic(
-            network=paths["sub_network"],
-            routes_xml=paths["micro_routes_wout"],
-            begin=begin_time,
-            end=end_time,
-            fcd_out=paths["micro_fcd_wout"],
-            tripinfo_out=paths["micro_tripinfo_wout"],
-            edgedata_out=paths["micro_edgedata_wout"],
-            rerouter_xml=None,
-        )
-    else:
-        print("---- WARNING: No vehicles extracted for WITHOUT closures scenario ----")
-        with open(paths["micro_fcd_wout"], 'w') as f:
-            f.write('<?xml version="1.0" encoding="UTF-8"?>\n<fcd-export/>\n')
-    
-    # ==========================================================================
-    # PHASE 5: Process outputs
-    # ==========================================================================
-    print("\n" + "=" * 60)
-    print("PHASE 5: OUTPUT PROCESSING")
-    print("=" * 60)
-    
-    # Convert FCD to JSON (from microscopic simulation)
-    print("---- converting microscopic FCD to JSON ----")
-    convert_fcd_to_outputs(
-        base_dir=base_dir,
-        fcd_with=paths["micro_fcd_with"],
-        fcd_wout=paths["micro_fcd_wout"],
-        trips_json_with=paths["fcd_trips_json_with"],
-        trips_json_wout=paths["fcd_trips_json_wout"],
-        insertion_rate=insertion_rate,
-        closed_edges=[str(e) for e in closed_edges_list],
-        network_xml=paths["sub_network"],  # Use subnetwork for coordinate conversion
-        begin_time=begin_time,
-        end_time=end_time,
-    )
-    
-    # Generate congestion maps from MESOSCOPIC edgedata (full network view)
-    print("---- generating congestion maps from mesoscopic data ----")
-    generate_congestion_maps(
-        base_dir=base_dir,
-        network_xml=net_path,  # Use full network for congestion map
-        edgedata_with=paths["meso_edgedata_with"],
-        edgedata_wout=paths["meso_edgedata_wout"],
-        output_with=paths["congestion_map_with"],
-        output_wout=paths["congestion_map_wout"],
-    )
-    
-    # Calculate metrics from MESOSCOPIC simulation (full network metrics)
-    print("---- calculating metrics from mesoscopic simulation ----")
-    metrics_report = compile_metrics_report(
-        tripinfo_with=paths["meso_tripinfo_with"],
-        tripinfo_wout=paths["meso_tripinfo_wout"],
-        edgedata_with=paths["meso_edgedata_with"],
-        edgedata_wout=paths["meso_edgedata_wout"],
-        routes_xml=routes_xml,
-        simulation_mode="hybrid",
-        begin_time=begin_time,
-        end_time=end_time,
-        insertion_rate=insertion_rate,
-        closed_edges_list=closed_edges_list,
-        extra_metadata={
-            "fcd_filter_shape": fcd_filter_shape_dict,
-            "hybrid_details": {
-                "mesoscopic_network": "full",
-                "microscopic_network": "subnetwork",
-                "vehicles_extracted_with_closures": vehicles_with,
-                "vehicles_extracted_without_closures": vehicles_wout,
-            }
-        }
-    )
-    
-    return metrics_report
-
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -672,13 +539,30 @@ def simulate(
     begin_time: int = Form(...),
     end_time: int = Form(...),
     insertion_rate: int = Form(3000),
-    closed_edges: str = Form("[]"),
+    scenarios: str = Form(...),
     routes_zip: Optional[UploadFile] = File(None),
     fcdFilterShape: Optional[str] = Form(None),
     simulation_mode: str = Form(SIMULATION_MODE.value)
 ) -> Any:
     """
     Run a SUMO simulation pipeline to produce traffic analysis outputs.
+    
+    Accepts up to 5 scenarios, each with different edge closures.
+    Results are sorted by total_delay_vh (best scenario first) and deltas
+    are calculated relative to the best scenario.
+    
+    Parameters:
+        scenarios: JSON array of scenario objects, each containing:
+            - name (str, required): Unique name for the scenario
+            - description (str, optional): Description of the scenario
+            - closed_edges (list[str], optional): List of edge IDs to close
+        
+        Example scenarios payload:
+        [
+            {"name": "baseline", "description": "No closures", "closed_edges": []},
+            {"name": "option_a", "description": "Close main street", "closed_edges": ["edge1"]},
+            {"name": "option_b", "closed_edges": ["edge2", "edge3"]}
+        ]
     
     Three simulation modes are available:
     
@@ -702,12 +586,13 @@ def simulate(
        - FCD trajectories come from microscopic (detailed area view)
        - Requires fcd_filter_shape to be set!
     
-    Returns a ZIP with: fcd_trips_with.json, fcd_trips_without.json, 
-    congestion_with.geojson, congestion_without.geojson, metrics.json
+    Returns a ZIP with:
+        - fcd_trips_{scenario_name}.json for each scenario (microscopic/hybrid modes)
+        - congestion_{scenario_name}.geojson for each scenario
+        - metrics.json with all scenarios sorted by performance
     """
     # Base dir is the directory containing this file
     base_dir = Path(__file__).resolve().parent
-    
     try:
         ensure_env()
         
@@ -724,13 +609,41 @@ def simulate(
                 detail=f"Invalid simulation_mode. Must be one of: {[m.value for m in SimulationMode]}"
             )
 
-        # Parse JSON fields from Form data
+        # Parse scenarios JSON
         try:
-            closed_edges_list = json.loads(closed_edges)
-            if not isinstance(closed_edges_list, list):
-                raise ValueError("closed_edges must be a list of strings")
+            scenarios_raw = json.loads(scenarios)
+            if not isinstance(scenarios_raw, list):
+                raise ValueError("scenarios must be a list")
         except json.JSONDecodeError:
-             raise HTTPException(status_code=400, detail="Invalid JSON in closed_edges")
+            raise HTTPException(status_code=400, detail="Invalid JSON in scenarios")
+        
+        # Validate scenarios
+        if len(scenarios_raw) == 0:
+            raise HTTPException(status_code=400, detail="At least one scenario is required")
+        if len(scenarios_raw) > MAX_SCENARIOS:
+            raise HTTPException(
+                status_code=400, 
+                detail=f"Maximum {MAX_SCENARIOS} scenarios allowed, got {len(scenarios_raw)}"
+            )
+        
+        # Parse and validate each scenario
+        scenarios_list: List[ScenarioInput] = []
+        scenario_names = set()
+        for i, s in enumerate(scenarios_raw):
+            try:
+                scenario = ScenarioInput(**s)
+                if scenario.name in scenario_names:
+                    raise HTTPException(
+                        status_code=400, 
+                        detail=f"Duplicate scenario name: '{scenario.name}'"
+                    )
+                scenario_names.add(scenario.name)
+                scenarios_list.append(scenario)
+            except Exception as e:
+                raise HTTPException(
+                    status_code=400, 
+                    detail=f"Invalid scenario at index {i}: {str(e)}"
+                )
         
         fcd_filter_shape_dict = None
         if fcdFilterShape:
@@ -797,230 +710,319 @@ def simulate(
                     routes_xml = paths["routes_xml"]
 
                 # ==============================================================
-                # BRANCH: Select simulation mode workflow
+                # MULTI-SCENARIO SIMULATION WORKFLOW
                 # ==============================================================
                 
+                print("\n" + "=" * 60)
+                print(f"RUNNING {len(scenarios_list)} SCENARIOS IN {mode.value.upper()} MODE")
+                print("=" * 60 + "\n")
+                
+                # Validate hybrid mode requirements
+                if mode == SimulationMode.HYBRID and not fcd_filter_shape_dict:
+                    raise HTTPException(
+                        status_code=400, 
+                        detail="fcd_filter_shape is required for hybrid mode. Please provide centerLon, centerLat, and radiusKm."
+                    )
+                
+                # For hybrid mode, extract subnetwork once (shared across scenarios)
+                sub_network_path = None
                 if mode == SimulationMode.HYBRID:
-                    # HYBRID MODE: Mesoscopic for full network + Microscopic for subnetwork
-                    print("\n" + "=" * 60)
-                    print("USING HYBRID SIMULATION MODE")
-                    print("=" * 60 + "\n")
+                    print("---- extracting subnetwork for hybrid mode ----")
+                    sub_network_path = paths["sub_network"]
+                    extract_subnetwork(
+                        full_network=net_path,
+                        output_network=sub_network_path,
+                        fcd_filter_shape=fcd_filter_shape_dict,
+                        buffer_km=0
+                    )
+                
+                # Store results for each scenario
+                scenario_outputs: List[Dict[str, Any]] = []
+                scenario_metrics_data: List[Dict[str, Any]] = []
+                
+                # Run simulation for each scenario
+                for scenario_idx, scenario in enumerate(scenarios_list):
+                    print(f"\n{'=' * 60}")
+                    print(f"SCENARIO {scenario_idx + 1}/{len(scenarios_list)}: {scenario.name}")
+                    print(f"Closed edges: {scenario.closed_edges}")
+                    print("=" * 60)
                     
-                    # Validate that fcd_filter_shape is provided for hybrid mode
-                    if not fcd_filter_shape_dict:
-                        raise HTTPException(
-                            status_code=400, 
-                            detail="fcd_filter_shape is required for hybrid mode. Please provide centerLon, centerLat, and radiusKm."
+                    # Build paths for this scenario
+                    s_paths = build_scenario_paths(
+                        paths["output_dir"], 
+                        scenario.name, 
+                        mode
+                    )
+                    
+                    closed_edges_list = [str(e) for e in scenario.closed_edges]
+                    
+                    if mode == SimulationMode.MICROSCOPIC:
+                        # Generate rerouters if closed edges exist
+                        if closed_edges_list:
+                            print(f"---- generating rerouters for {scenario.name} ----")
+                            generate_rerouters(
+                                network=net_path,
+                                closed_edges=closed_edges_list,
+                                begin=begin_time,
+                                end=end_time,
+                                out_xml=s_paths["rerouter_file"],
+                            )
+                        
+                        # Run microscopic simulation
+                        print(f"---- running microscopic simulation for {scenario.name} ----")
+                        run_sumo_microscopic(
+                            network=net_path,
+                            routes_xml=routes_xml,
+                            begin=begin_time,
+                            end=end_time,
+                            fcd_out=s_paths["fcd"],
+                            tripinfo_out=s_paths["tripinfo"],
+                            edgedata_out=s_paths["edgedata"],
+                            rerouter_xml=s_paths["rerouter_file"] if closed_edges_list else None,
                         )
+                        
+                        # Convert FCD to JSON
+                        convert_fcd_to_json(
+                            base_dir=base_dir,
+                            fcd_xml=s_paths["fcd"],
+                            trips_json=s_paths["fcd_trips_json"],
+                            network_xml=net_path,
+                            insertion_rate=insertion_rate,
+                            closed_edges=closed_edges_list,
+                            begin_time=begin_time,
+                            end_time=end_time,
+                            scenario_name=scenario.name,
+                        )
+                        
+                        # Generate congestion map
+                        print(f"---- generating congestion map for {scenario.name} ----")
+                        generate_congestion_map(
+                            base_dir=base_dir,
+                            network_xml=net_path,
+                            edgedata=s_paths["edgedata"],
+                            output=s_paths["congestion_map"],
+                        )
+                        
+                        # Store paths for metrics calculation
+                        scenario_metrics_data.append({
+                            "name": scenario.name,
+                            "description": scenario.description,
+                            "closed_edges": closed_edges_list,
+                            "tripinfo_path": s_paths["tripinfo"],
+                            "edgedata_path": s_paths["edgedata"],
+                        })
+                        
+                        scenario_outputs.append({
+                            "name": scenario.name,
+                            "fcd_trips_json": s_paths["fcd_trips_json"],
+                            "congestion_map": s_paths["congestion_map"],
+                        })
                     
-                    # Run the hybrid simulation workflow
-                    metrics_report = run_hybrid_simulation(
-                        base_dir=base_dir,
-                        paths=paths,
-                        net_path=net_path,
-                        routes_xml=routes_xml,
-                        begin_time=begin_time,
-                        end_time=end_time,
-                        insertion_rate=insertion_rate,
-                        closed_edges_list=[str(e) for e in closed_edges_list],
-                        fcd_filter_shape_dict=fcd_filter_shape_dict,
-                    )
+                    elif mode == SimulationMode.MESOSCOPIC:
+                        # Generate rerouters if closed edges exist
+                        if closed_edges_list:
+                            print(f"---- generating rerouters for {scenario.name} ----")
+                            generate_rerouters(
+                                network=net_path,
+                                closed_edges=closed_edges_list,
+                                begin=begin_time,
+                                end=end_time,
+                                out_xml=s_paths["rerouter_file"],
+                            )
+                        
+                        # Run mesoscopic simulation
+                        print(f"---- running mesoscopic simulation for {scenario.name} ----")
+                        run_sumo_mesoscopic(
+                            network=net_path,
+                            routes_xml=routes_xml,
+                            begin=begin_time,
+                            end=end_time,
+                            tripinfo_out=s_paths["tripinfo"],
+                            edgedata_out=s_paths["edgedata"],
+                            vehroute_out=s_paths["vehroute"],
+                            rerouter_xml=s_paths["rerouter_file"] if closed_edges_list else None,
+                        )
+                        
+                        # Generate congestion map
+                        print(f"---- generating congestion map for {scenario.name} ----")
+                        generate_congestion_map(
+                            base_dir=base_dir,
+                            network_xml=net_path,
+                            edgedata=s_paths["edgedata"],
+                            output=s_paths["congestion_map"],
+                        )
+                        
+                        # Mesoscopic doesn't produce FCD, create empty file
+                        empty_trips = {
+                            "trips": [], 
+                            "metadata": {
+                                "note": "Mesoscopic simulation does not produce FCD trajectories",
+                                "scenario": scenario.name
+                            }
+                        }
+                        with open(s_paths["fcd_trips_json"], "w", encoding="utf-8") as f:
+                            json.dump(empty_trips, f, indent=2)
+                        
+                        # Store paths for metrics calculation
+                        scenario_metrics_data.append({
+                            "name": scenario.name,
+                            "description": scenario.description,
+                            "closed_edges": closed_edges_list,
+                            "tripinfo_path": s_paths["tripinfo"],
+                            "edgedata_path": s_paths["edgedata"],
+                        })
+                        
+                        scenario_outputs.append({
+                            "name": scenario.name,
+                            "fcd_trips_json": s_paths["fcd_trips_json"],
+                            "congestion_map": s_paths["congestion_map"],
+                        })
                     
-                    memory_file = create_simulation_output_zip(
-                        fcd_trips_json_with=paths["fcd_trips_json_with"],
-                        fcd_trips_json_wout=paths["fcd_trips_json_wout"],
-                        metrics_report=metrics_report,
-                        congestion_map_with=paths["congestion_map_with"],
-                        congestion_map_wout=paths["congestion_map_wout"],
-                        output_dir=paths["output_dir"],
-                    )
-                    
-                    return Response(
-                        content=memory_file.getvalue(),
-                        media_type="application/zip",
-                        headers={"Content-Disposition": "attachment; filename=simulation_outputs.zip"}
-                    )
+                    elif mode == SimulationMode.HYBRID:
+                        # HYBRID MODE: Mesoscopic + Microscopic
+                        
+                        # Phase 1: Mesoscopic simulation on full network
+                        if closed_edges_list:
+                            print(f"---- generating rerouters for {scenario.name} (mesoscopic) ----")
+                            generate_rerouters(
+                                network=net_path,
+                                closed_edges=closed_edges_list,
+                                begin=begin_time,
+                                end=end_time,
+                                out_xml=s_paths["rerouter_file"],
+                            )
+                        
+                        print(f"---- running mesoscopic simulation for {scenario.name} ----")
+                        run_sumo_mesoscopic(
+                            network=net_path,
+                            routes_xml=routes_xml,
+                            begin=begin_time,
+                            end=end_time,
+                            tripinfo_out=s_paths["meso_tripinfo"],
+                            edgedata_out=s_paths["meso_edgedata"],
+                            vehroute_out=s_paths["meso_vehroute"],
+                            rerouter_xml=s_paths["rerouter_file"] if closed_edges_list else None,
+                        )
+                        
+                        # Phase 2: Extract demand for microscopic simulation
+                        print(f"---- extracting demand for {scenario.name} ----")
+                        vehicles_extracted = extract_demand_for_subnetwork(
+                            vehroute_xml=s_paths["meso_vehroute"],
+                            full_network=net_path,
+                            sub_network=sub_network_path,
+                            output_routes=s_paths["micro_routes"],
+                            fcd_filter_shape=fcd_filter_shape_dict,
+                            begin=begin_time,
+                            end=end_time,
+                        )
+                        
+                        # Phase 3: Microscopic simulation on subnetwork
+                        # Filter closed edges to subnetwork
+                        import sys
+                        sumo_tools = Path(os.environ["SUMO_HOME"]) / "tools"
+                        if str(sumo_tools) not in sys.path:
+                            sys.path.append(str(sumo_tools))
+                        import sumolib
+                        
+                        sub_net = sumolib.net.readNet(str(sub_network_path))
+                        sub_edge_ids = set(edge.getID() for edge in sub_net.getEdges())
+                        micro_closed_edges = [e for e in closed_edges_list if e in sub_edge_ids]
+                        
+                        micro_rerouter_path = None
+                        if micro_closed_edges:
+                            print(f"---- generating rerouters for {scenario.name} (microscopic) ----")
+                            generate_rerouters(
+                                network=sub_network_path,
+                                closed_edges=micro_closed_edges,
+                                begin=begin_time,
+                                end=end_time,
+                                out_xml=s_paths["micro_rerouter_file"],
+                            )
+                            micro_rerouter_path = s_paths["micro_rerouter_file"]
+                        
+                        if vehicles_extracted > 0:
+                            print(f"---- running microscopic simulation for {scenario.name} ----")
+                            run_sumo_microscopic(
+                                network=sub_network_path,
+                                routes_xml=s_paths["micro_routes"],
+                                begin=begin_time,
+                                end=end_time,
+                                fcd_out=s_paths["micro_fcd"],
+                                tripinfo_out=s_paths["micro_tripinfo"],
+                                edgedata_out=s_paths["micro_edgedata"],
+                                rerouter_xml=micro_rerouter_path,
+                            )
+                        else:
+                            print(f"---- WARNING: No vehicles extracted for {scenario.name} ----")
+                            with open(s_paths["micro_fcd"], 'w') as f:
+                                f.write('<?xml version="1.0" encoding="UTF-8"?>\n<fcd-export/>\n')
+                        
+                        # Convert FCD to JSON
+                        convert_fcd_to_json(
+                            base_dir=base_dir,
+                            fcd_xml=s_paths["micro_fcd"],
+                            trips_json=s_paths["fcd_trips_json"],
+                            network_xml=sub_network_path,
+                            insertion_rate=insertion_rate,
+                            closed_edges=closed_edges_list,
+                            begin_time=begin_time,
+                            end_time=end_time,
+                            scenario_name=scenario.name,
+                        )
+                        
+                        # Generate congestion map from mesoscopic data (full network)
+                        print(f"---- generating congestion map for {scenario.name} ----")
+                        generate_congestion_map(
+                            base_dir=base_dir,
+                            network_xml=net_path,
+                            edgedata=s_paths["meso_edgedata"],
+                            output=s_paths["congestion_map"],
+                        )
+                        
+                        # Store paths for metrics calculation (using mesoscopic for metrics)
+                        scenario_metrics_data.append({
+                            "name": scenario.name,
+                            "description": scenario.description,
+                            "closed_edges": closed_edges_list,
+                            "tripinfo_path": s_paths["meso_tripinfo"],
+                            "edgedata_path": s_paths["meso_edgedata"],
+                        })
+                        
+                        scenario_outputs.append({
+                            "name": scenario.name,
+                            "fcd_trips_json": s_paths["fcd_trips_json"],
+                            "congestion_map": s_paths["congestion_map"],
+                        })
                 
-                elif mode == SimulationMode.MICROSCOPIC:
-                    # MICROSCOPIC MODE: Microscopic simulation on full network
-                    print("\n" + "=" * 60)
-                    print("USING MICROSCOPIC SIMULATION MODE")
-                    print("=" * 60 + "\n")
-                    
-                    # 1) Rerouters (only if closed edges provided)
-                    print("---- generating rerouters ----")
-                    generate_rerouters(
-                        network=net_path,
-                        closed_edges=[str(e) for e in closed_edges_list],
-                        begin=begin_time,
-                        end=end_time,
-                        out_xml=paths["rerouter_file"],
-                    )
-
-                    print("---- running microscopic simulation with closed edges ----")
-                    run_sumo_microscopic(
-                        network=net_path,
-                        routes_xml=routes_xml,
-                        begin=begin_time,
-                        end=end_time,
-                        fcd_out=paths["fcd_with"],
-                        tripinfo_out=paths["tripinfo_with"],
-                        edgedata_out=paths["edgedata_with"],
-                        rerouter_xml=paths["rerouter_file"] if closed_edges_list else None,
-                    )
-                    print("---- running microscopic simulation without closed edges ----")
-                    run_sumo_microscopic(
-                        network=net_path,
-                        routes_xml=routes_xml,
-                        begin=begin_time,
-                        end=end_time,
-                        fcd_out=paths["fcd_wout"],
-                        tripinfo_out=paths["tripinfo_wout"],
-                        edgedata_out=paths["edgedata_wout"],
-                        rerouter_xml=None,
-                    )
-                    print("---- converting outputs ----")
-                    # 4) Convert outputs
-                    convert_fcd_to_outputs(
-                        base_dir=base_dir,
-                        fcd_with=paths["fcd_with"],
-                        fcd_wout=paths["fcd_wout"],
-                        trips_json_with=paths["fcd_trips_json_with"],
-                        trips_json_wout=paths["fcd_trips_json_wout"],
-                        insertion_rate=insertion_rate,
-                        closed_edges=[str(e) for e in closed_edges_list],
-                        network_xml=net_path,
-                        begin_time=begin_time,
-                        end_time=end_time,
-                    )
-
-                    # 5) Generate congestion maps
-                    print("---- generating congestion maps ----")
-                    generate_congestion_maps(
-                        base_dir=base_dir,
-                        network_xml=net_path,
-                        edgedata_with=paths["edgedata_with"],
-                        edgedata_wout=paths["edgedata_wout"],
-                        output_with=paths["congestion_map_with"],
-                        output_wout=paths["congestion_map_wout"],
-                    )
-                    
-                    # 6) Calculate metrics and create output
-                    metrics_report = compile_metrics_report(
-                        tripinfo_with=paths["tripinfo_with"],
-                        tripinfo_wout=paths["tripinfo_wout"],
-                        edgedata_with=paths["edgedata_with"],
-                        edgedata_wout=paths["edgedata_wout"],
-                        routes_xml=paths["routes_xml"],
-                        simulation_mode="standard_microscopic",
-                        begin_time=begin_time,
-                        end_time=end_time,
-                        insertion_rate=insertion_rate,
-                        closed_edges_list=closed_edges_list,
-                    )
-                    
-                    memory_file = create_simulation_output_zip(
-                        fcd_trips_json_with=paths["fcd_trips_json_with"],
-                        fcd_trips_json_wout=paths["fcd_trips_json_wout"],
-                        metrics_report=metrics_report,
-                        congestion_map_with=paths["congestion_map_with"],
-                        congestion_map_wout=paths["congestion_map_wout"],
-                        output_dir=paths["output_dir"],
-                    )
-
-                    return Response(
-                        content=memory_file.getvalue(),
-                        media_type="application/zip",
-                        headers={"Content-Disposition": "attachment; filename=simulation_outputs.zip"}
-                    )
+                # Compile metrics report with all scenarios
+                print("\n" + "=" * 60)
+                print("COMPILING METRICS REPORT")
+                print("=" * 60)
                 
-                elif mode == SimulationMode.MESOSCOPIC:
-                    # MESOSCOPIC MODE: Mesoscopic simulation on full network
-                    print("\n" + "=" * 60)
-                    print("USING MESOSCOPIC SIMULATION MODE")
-                    print("=" * 60 + "\n")
-                    
-                    # 1) Rerouters (only if closed edges provided)
-                    print("---- generating rerouters ----")
-                    generate_rerouters(
-                        network=net_path,
-                        closed_edges=[str(e) for e in closed_edges_list],
-                        begin=begin_time,
-                        end=end_time,
-                        out_xml=paths["rerouter_file"],
-                    )
-
-                    print("---- running mesoscopic simulation WITH closures ----")
-                    # Run mesoscopic simulations
-                    run_sumo_mesoscopic(
-                        network=net_path,
-                        routes_xml=routes_xml,
-                        begin=begin_time,
-                        end=end_time,
-                        tripinfo_out=paths["tripinfo_with"],
-                        edgedata_out=paths["edgedata_with"],
-                        vehroute_out=paths["vehroute_with"],
-                        rerouter_xml=paths["rerouter_file"] if closed_edges_list else None,
-                    )
-                    
-                    print("---- running mesoscopic simulation WITHOUT closures ----")
-                    run_sumo_mesoscopic(
-                        network=net_path,
-                        routes_xml=routes_xml,
-                        begin=begin_time,
-                        end=end_time,
-                        tripinfo_out=paths["tripinfo_wout"],
-                        edgedata_out=paths["edgedata_wout"],
-                        vehroute_out=paths["vehroute_wout"],
-                        rerouter_xml=None,
-                    )
-                    
-                    # 5) Generate congestion maps
-                    print("---- generating congestion maps ----")
-                    generate_congestion_maps(
-                        base_dir=base_dir,
-                        network_xml=net_path,
-                        edgedata_with=paths["edgedata_with"],
-                        edgedata_wout=paths["edgedata_wout"],
-                        output_with=paths["congestion_map_with"],
-                        output_wout=paths["congestion_map_wout"],
-                    )
-                    
-                    # 6) Calculate metrics
-                    metrics_report = compile_metrics_report(
-                        tripinfo_with=paths["tripinfo_with"],
-                        tripinfo_wout=paths["tripinfo_wout"],
-                        edgedata_with=paths["edgedata_with"],
-                        edgedata_wout=paths["edgedata_wout"],
-                        routes_xml=paths["routes_xml"],
-                        simulation_mode="mesoscopic",
-                        begin_time=begin_time,
-                        end_time=end_time,
-                        insertion_rate=insertion_rate,
-                        closed_edges_list=closed_edges_list,
-                    )
-                    
-                    # Note: Mesoscopic mode doesn't produce FCD data, so create empty JSON files
-                    empty_trips = {"trips": [], "metadata": {"note": "Mesoscopic simulation does not produce FCD trajectories"}}
-                    with open(paths["fcd_trips_json_with"], "w", encoding="utf-8") as f:
-                        json.dump(empty_trips, f, indent=2)
-                    with open(paths["fcd_trips_json_wout"], "w", encoding="utf-8") as f:
-                        json.dump(empty_trips, f, indent=2)
-
-                    memory_file = create_simulation_output_zip(
-                        fcd_trips_json_with=paths["fcd_trips_json_with"],
-                        fcd_trips_json_wout=paths["fcd_trips_json_wout"],
-                        metrics_report=metrics_report,
-                        congestion_map_with=paths["congestion_map_with"],
-                        congestion_map_wout=paths["congestion_map_wout"],
-                        output_dir=paths["output_dir"],
-                    )
-
-                    return Response(
-                        content=memory_file.getvalue(),
-                        media_type="application/zip",
-                        headers={"Content-Disposition": "attachment; filename=simulation_outputs.zip"}
-                    )
+                metrics_report = compile_metrics_report_multi_scenario(
+                    scenario_outputs=scenario_metrics_data,
+                    routes_xml=routes_xml,
+                    simulation_mode=mode.value,
+                    begin_time=begin_time,
+                    end_time=end_time,
+                    insertion_rate=insertion_rate,
+                    extra_metadata={
+                        "fcd_filter_shape": fcd_filter_shape_dict,
+                    } if fcd_filter_shape_dict else None,
+                )
+                
+                # Create output ZIP
+                memory_file = create_simulation_output_zip_multi_scenario(
+                    scenario_outputs=scenario_outputs,
+                    metrics_report=metrics_report,
+                    output_dir=paths["output_dir"],
+                )
+                
+                return Response(
+                    content=memory_file.getvalue(),
+                    media_type="application/zip",
+                    headers={"Content-Disposition": "attachment; filename=simulation_outputs.zip"}
+                )
 
     except subprocess.CalledProcessError as e:
         raise e

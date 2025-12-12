@@ -1,0 +1,49 @@
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: traffic-twin-backend
+    environment:
+      - PORT=8000
+      - SUMO_HOME=/usr/share/sumo
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    networks:
+      - traffic-twin-network
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: traffic-twin-caddy
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    restart: unless-stopped
+    depends_on:
+      - backend
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    networks:
+      - traffic-twin-network
+
+volumes:
+  caddy_data:
+  caddy_config:
+
+networks:
+  traffic-twin-network:
+    driver: bridge

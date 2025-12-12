@@ -659,7 +659,6 @@ def simulate(
             # Use temporary directory for request isolation
             with tempfile.TemporaryDirectory() as tmp_dir_str:
                 tmp_dir = Path(tmp_dir_str)
-                tmp_dir = Path("./output_test")
                 # Setup output paths based on simulation mode
                 paths = build_output_paths(tmp_dir, mode)
                 

@@ -1,0 +1,119 @@
+# ============================================
+# Large data files (CRITICAL - reduces build context significantly)
+# ============================================
+*.osm
+*.osm.pbf
+*.pbf
+*.net.xml
+*.rou.xml
+*.geojson
+!brussels.geojson
+
+# SUMO network generator data
+sumo_network_generator/
+!sumo_network_generator/*.py
+
+# Output directories
+output/
+output_test/
+
+# ============================================
+# Python
+# ============================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+env/
+.eggs/
+*.egg
+pip-log.txt
+pip-delete-this-directory.txt
+
+# ============================================
+# Virtual environments
+# ============================================
+.venv/
+venv/
+ENV/
+env/
+.env
+
+# ============================================
+# IDE and editors
+# ============================================
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+.settings/
+
+# ============================================
+# Git
+# ============================================
+.git/
+.gitignore
+.gitattributes
+
+# ============================================
+# Testing
+# ============================================
+tests/
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+coverage.xml
+*.cover
+.hypothesis/
+
+# ============================================
+# Documentation
+# ============================================
+*.md
+docs/
+
+# ============================================
+# Logs and temp files
+# ============================================
+*.log
+logs/
+tmp/
+temp/
+
+# ============================================
+# OS files
+# ============================================
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# ============================================
+# Docker (don't include docker files in context)
+# ============================================
+Dockerfile*
+docker-compose*.yml
+docker-compose*.yaml
+.dockerignore
+Caddyfile
+
+# ============================================
+# Misc
+# ============================================
+*.bak
+*.backup
+Makefile

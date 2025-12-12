@@ -1,0 +1,39 @@
+# Caddyfile for Traffic Twin Backend
+# This file configures Caddy as a reverse proxy for the backend service
+
+# For production with a domain name, uncomment and configure:
+# your-domain.com {
+#     reverse_proxy backend:8000 {
+#         header_up Host {host}
+#         header_up X-Real-IP {remote}
+#         header_up X-Forwarded-For {remote}
+#         header_up X-Forwarded-Proto {scheme}
+#     }
+#     
+#     # Enable compression
+#     encode gzip
+#     
+#     # Logging
+#     log {
+#         output file /var/log/caddy/access.log
+#     }
+# }
+
+# For local development/testing without SSL:
+localhost {
+    reverse_proxy backend:8000 {
+        header_up Host {host}
+        header_up X-Real-IP {remote}
+        header_up X-Forwarded-For {remote}
+        header_up X-Forwarded-Proto {scheme}
+    }
+    
+    # Enable compression
+    encode gzip
+}
+
+# Alternative: Simple reverse proxy on port 80
+# :80 {
+#     reverse_proxy backend:8000
+# }
+

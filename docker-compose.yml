@@ -29,6 +29,8 @@ services:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data
       - caddy_config:/config
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     restart: unless-stopped
     depends_on:
       - backend
